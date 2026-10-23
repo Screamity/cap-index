@@ -1,6 +1,6 @@
 # Cap Index Author & Maintainer Guide / 作者与维护者指南
 
-Applies to Cap Index 0.4.0. 适用于 Cap Index 0.4.0。
+Applies to Cap Index v0.4.0. 适用于 Cap Index v0.4.0。
 
 This guide has two parts. 本文档分为两部分：
 

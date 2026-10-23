@@ -72,7 +72,7 @@ node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" build --client qoder --refr
 
 `must` 可取 `trusted-only`（默认）、`always`、`never`；环境变量 `CAP_INDEX_MUST` 优先。
 
-## 0.4.0 变更
+## v0.4.0 变更
 
 - 新增内置中英同义词 / 别名层，作为软触发词参与召回，不参与 `[必须]` 计分。
 - 英文触发词支持词级弹性匹配，允许少量间隔词；MCP 工具增加“动作 + 对象”关键词。
