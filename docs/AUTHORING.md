@@ -1,6 +1,6 @@
 # Cap Index Author & Maintainer Guide / 作者与维护者指南
 
-Applies to Cap Index 0.3.0. 适用于 Cap Index 0.3.0。
+Applies to Cap Index 0.4.0. 适用于 Cap Index 0.4.0。
 
 This guide has two parts. 本文档分为两部分：
 
@@ -61,15 +61,19 @@ A bare mapping without the `routing` wrapper is also accepted:
 
 | Mode | Behavior | Typical use |
 | --- | --- | --- |
-| `directive` | Can be marked `[必须]`; participates in the default delegation rule. | MCP-backed capabilities, task skills, experts. |
-| `advisory` | Never marked `[必须]` and never triggers delegation alone. Shown as `[建议]` when a directive route also matches. | Guidelines, conventions, review hints. |
+| `directive` | Can be a `[必须]` candidate when it ranks highest overall and passes the score, margin, evidence, and MCP health gates. At most one mandatory route per injection. | MCP-backed capabilities, task skills, experts. |
+| `advisory` | Always `[建议]`, never `[必须]` and never triggers delegation. | Guidelines, conventions, review hints. |
 | `off` | Excluded from routing and from the static routing table. | Slash-command-only or intentionally hidden skills. |
 
 | 模式 | 行为 | 适用场景 |
 | --- | --- | --- |
-| `directive` | 可被标为 `[必须]`，参与默认委派规则。 | MCP 能力、任务型 skill、专家能力。 |
-| `advisory` | 永不被标 `[必须]`，不会单独触发委派；有 directive 命中时显示 `[建议]`。 | 行为准则、编码规范、评审建议。 |
+| `directive` | 只有同时满足最高分、绝对分、领先幅度、证据门槛与 MCP 健康度时，才可能标 `[必须]`；每次注入最多一条。 | MCP 能力、任务型 skill、专家能力。 |
+| `advisory` | 始终为 `[建议]`，永不被标 `[必须]`，也不触发委派。 | 行为准则、编码规范、评审建议。 |
 | `off` | 不参与路由，也不写入静态路由表。 | 仅斜杠命令、刻意隐藏的 skill。 |
+
+> The default user policy is `trusted-only`. It requires trigger, strong-keyword, or soft-alias evidence, or `"trust": "high"` on the entry. Users can switch with `routing.must` (`trusted-only` / `always` / `never`) or `CAP_INDEX_MUST`.
+>
+> 用户默认策略为 `trusted-only`，要求触发词、强关键词或软触发词证据，或条目设置 `"trust": "high"`。用户可用 `routing.must`（`trusted-only` / `always` / `never`）或 `CAP_INDEX_MUST` 切换。
 
 ### A5. Precedence / 优先级
 
@@ -145,15 +149,55 @@ Windows PowerShell: replace `$HOME` with `$env:USERPROFILE` and pipe with `'{"pr
 
 Expected behavior / 预期行为：
 
-- A high-confidence directive route is tagged `[必须]` and a delegation header is injected. 高置信 directive 会标 `[必须]` 并注入委派规则。
-- Advisory routes are tagged `[建议]` only when a directive route also matches; advisory-only matches use the suggestion header without a delegation rule. 只有同时存在 directive 命中时 advisory 才标 `[建议]`；仅 advisory 命中时使用建议式提示，不含委派规则。
+- A directive route is tagged `[必须]` only when it is the highest-scoring match and passes the absolute score, margin, evidence, and MCP health gates; at most one route is mandatory. 只有所有命中中得分最高且通过绝对分、领先幅度、证据与 MCP 健康度门槛的 directive 才会标 `[必须]`，且最多一条。
+- All other matches are tagged `[建议]`. Low-confidence or no-mandatory results use the suggestion header without a delegation rule. 其余命中一律标 `[建议]`；低置信或没有条目通过门槛时使用建议式提示，不含委派规则。
 - `off` routes never appear and are not written to `capability-index.md`. `off` 不会出现在路由中，也不会写入静态路由表。
 
 `~/.cap-index/qoder/capabilities.json` also records `mode` and `modeReason` for each entry. `modeReason: "author"` confirms your declaration was applied.
 
 `~/.cap-index/qoder/capabilities.json` 会记录每条路由的 `mode` 和 `modeReason`；`author` 表示你的声明已生效。
 
-### A9. FAQ / 常见问题
+### A9. Trigger quality and `explain` / 触发词质量与解释
+
+You usually do not need to declare triggers. Cap Index derives them from explicit intent markers in the skill description:
+
+通常不需要手写触发词。Cap Index 会从描述中的明确意图标记自动提取：
+
+- English: `Use when…`, `Use for…`, `Use to…`
+- Chinese: `适用于…`, `用于…`, `用来…`, `当…时`, `使用场景：`
+
+Generic verbs, subjects, and long sentence fragments are filtered; at most four triggers are kept. Descriptions that say `Do not use for…` / `不适用于…` become hard `notFor` exclusions. Write descriptions in those forms when you want reliable automatic routing. 通用动词、主语和长句碎片会被过滤，每条最多 4 个触发词；`Do not use for…` / `不适用于…` 会转成硬排除短语。想让路由稳定，就在描述里使用这些句式。
+
+Each entry also gets tiered keywords: name, tool action+object pairs, and description phrases yield strong keywords (×0.8, capped 2.4); description words are weak (×0.3, capped 1.2 when stronger evidence exists). A weak-only match is not injected by default. Curated bilingual alias groups add soft triggers (×0.85, capped 2.4) for synonym recall; they never contribute to `[必须]` scoring. Matches whose evidence is fully covered by a stronger entry are suppressed as duplicates. Users can add curated `triggers` or `notFor` in `~/.cap-index/qoder/overrides.json`.
+
+每条条目还会有分层关键词：名称、MCP 工具的动作+对象组合与描述短语为强关键词（×0.8，封顶 2.4）；描述词为弱关键词（×0.3，有强证据时封顶 1.2）。仅弱关键词命中默认不注入。内置双语别名组会附加软触发词（×0.85，封顶 2.4）用于同义词召回，但不参与 `[必须]` 计分；命中词被更强条目完全覆盖时按重复条目抑制。用户可在 `~/.cap-index/qoder/overrides.json` 中补充 `triggers` 或 `notFor`。
+
+To see why a prompt did or did not route, use `explain`:
+
+想确认某条 prompt 为什么命中或没命中，使用 `explain`：
+
+```bash
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT"
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT" --json
+```
+
+The output shows the threshold, per-entry score components, matched trigger / strong / weak tokens, status, and the reason an entry was not injected. 输出包含阈值、每个条目的分数构成、命中的触发词/强词/弱词、状态与未注入原因。
+
+**Description safety / 描述安全**
+
+Write capability descriptions as declarative purpose statements. Build-time sanitization removes control and zero-width characters, ANSI escapes, HTML/script/style content, code fences, and URLs. Route lines never copy imperative or instruction-like sentences; when no safe summary remains, the route falls back to `name → target`.
+
+描述应写成陈述性的用途说明。构建时会移除控制字符与零宽字符、ANSI 转义、HTML/script/style、代码块和 URL；祈使句或指令式内容不会进入路由行，没有安全摘要时退回 `名称 → 目标`。
+
+Limits / 上限：
+
+- skill description 2000 chars; MCP instructions 300 chars; tool purpose 160 chars. skill 描述 2000 字，MCP instructions 300 字，工具用途 160 字。
+- Route line 150 chars; one injection is capped at 600 chars / ~240 tokens. 路由行 150 字；单次注入 600 字 / 约 240 tokens。
+- Over-budget injections drop the longest suggestions first and never drop the mandatory route. 超预算时优先丢弃最长的建议，不丢必须。
+
+Do not use plugin descriptions to carry operational instructions. Put those in the skill body or docs, where they are not copied into the routing hint. 不要在描述里放操作指令；把命令与步骤写在 skill 正文或文档里，它们不会被复制进路由提示。
+
+### A10. FAQ / 常见问题
 
 **Declaration has no effect / 声明不生效**
 
@@ -200,8 +244,8 @@ Before official publication, fill in the author metadata; it is intentionally le
 
 ```json
 "author": { "name": "<your name>", "email": "<your email>" },
-"homepage": "https://github.com/<owner>/<repo>",
-"repository": "https://github.com/<owner>/<repo>"
+"homepage": "https://github.com/Screamity/cap-index",
+"repository": "https://github.com/Screamity/cap-index"
 ```
 
 Keep runtime-only fields in `plugin.json`. Listing fields such as `category`, `tags`, `logo`, `interface`, and `descriptionZh` belong to marketplace metadata; the current runtime ignores them in `plugin.json` and emits validation warnings.
@@ -257,8 +301,8 @@ Windows PowerShell:
 
 ```powershell
 cd <parent-of-plugin>
-Compress-Archive -Path .\cap-index -DestinationPath .\cap-index-0.3.0.zip
-Get-FileHash .\cap-index-0.3.0.zip -Algorithm SHA256
+Compress-Archive -Path .\cap-index -DestinationPath .\cap-index-0.4.0.zip
+Get-FileHash .\cap-index-0.4.0.zip -Algorithm SHA256
 ```
 
 Validate the extracted package, not only the source directory. 校验解压后的包，而不只是源码目录。
@@ -268,7 +312,7 @@ Validate the extracted package, not only the source directory. 校验解压后�
 **Option 1 — Direct HTTPS zip / 直接 HTTPS 安装**
 
 ```bash
-qodercli plugins install https://github.com/<owner>/<repo>/releases/download/v0.3.0/cap-index-0.3.0.zip
+qodercli plugins install https://github.com/Screamity/cap-index/releases/download/v0.4.0/cap-index-0.4.0.zip
 ```
 
 **Option 2 — Self-hosted marketplace / 自建市场**
@@ -285,11 +329,11 @@ Create a `marketplace.json` that points to the release asset:
     {
       "name": "cap-index",
       "description": "Per-prompt capability routing for skills and MCP servers.",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "author": { "name": "<your name>" },
       "source": {
         "source": "archive",
-        "url": "https://github.com/<owner>/<repo>/releases/download/v0.3.0/cap-index-0.3.0.zip",
+        "url": "https://github.com/Screamity/cap-index/releases/download/v0.4.0/cap-index-0.4.0.zip",
         "sha256": "<sha256-of-zip>"
       }
     }
@@ -302,7 +346,7 @@ Users then run:
 用户随后执行：
 
 ```bash
-qodercli plugins marketplace add https://raw.githubusercontent.com/<owner>/<repo>/main/marketplace.json
+qodercli plugins marketplace add https://raw.githubusercontent.com/Screamity/cap-index/main/marketplace.json
 qodercli plugins install cap-index
 ```
 
@@ -360,7 +404,8 @@ To rebuild from scratch, delete `~/.cap-index/qoder/` and run `build --refresh`.
 
 ### B8. Security / 安全
 
-- Cap Index stores tool names, purposes, and status only. 只保存工具名、用途与状态。
+- Cap Index stores tool names, sanitized purposes, triggers, and status only. 只保存工具名、清洗后的用途、触发词与状态。
+- Third-party descriptions are sanitized and length-capped; imperative or injection-like sentences are excluded from route text. 第三方描述会清洗并限制长度；祈使句与注入话术不会进入路由文本。
 - Error messages pass through redaction. 错误信息会脱敏。
 - Do not paste MCP credentials into issues or docs. 不要把 MCP 凭据贴到 issue 或文档中。
 - Review the bundle before publishing; it is a single self-contained file. 发布前审查打包后的单文件运行时。

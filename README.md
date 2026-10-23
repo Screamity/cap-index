@@ -8,11 +8,11 @@
 
 ```bash
 qodercli plugins install <本目录>
-# 或先打包成 zip 再安装
-qodercli plugins install ./cap-index-0.3.0.zip
-# 发布后可从 HTTPS 直接安装
-qodercli plugins install https://github.com/<owner>/<repo>/releases/download/v0.3.0/cap-index-0.3.0.zip
+# 或从 Release zip 安装
+qodercli plugins install https://github.com/Screamity/cap-index/releases/download/v0.4.0/cap-index-0.4.0.zip
 ```
+
+本地 zip 文件不受支持：请先解压，再安装解压出的插件目录。
 
 本地验证：
 
@@ -30,41 +30,28 @@ qodercli --plugin-dir <本目录> -p "帮我做个PPT"
   - `UserPromptSubmit`：读取索引，匹配当前 prompt，通过 `hookSpecificOutput.additionalContext` 注入 top-k 路由
 - `skills/cap-index/SKILL.md`：排查与重建索引的说明
 - `commands/cap-index.md`：`/cap-index [list|build|check]`
-- `cap-index.bundle.mjs` + `defaults/overrides.json`：单文件运行时与空默认词表；每条路由由安装者本机的 skills / MCP 自动生成
-- `docs/AUTHORING.md`：插件作者接入与维护者发布指南（中英双语）
+- `cap-index.bundle.mjs` + `defaults/overrides.json`：单文件运行时与出厂覆盖（默认为空，路由从本机已安装能力自动生成）
 
-## 路由分级
+## 匹配与诊断
 
-每次 prompt 只注入与当前请求相关的能力，并按命中强度分级：
+- 触发词从明确的意图标记提取（`Use when…`、`适用于…`、`当…时`），通用词和长句碎片会被过滤。
+- 英文按词级匹配并允许少量间隔词；内置中英别名组提供软触发词，用于同义词召回，但不参与 `[必须]` 计分。
+- 关键词分强 / 弱两层；只有弱关键词命中时不注入，除非条目设置 `trust: "high"` 或策略为 `always`。
+- `notFor`（`Do not use for…` / `不适用于…`）是硬排除；阈值只统计可注入候选。
+- 第三方描述会先清洗：移除控制/零宽字符、HTML/script、代码块与 URL；路由行跳过祈使句和注入话术，没有安全摘要时只保留名称。
+- 单条路由行最多 150 字，单次注入最多 600 字 / 约 240 tokens；超限优先丢弃最长的建议，不丢必须。
+- 用 `explain` 查看一条 prompt 的完整判定链：
 
-- 命中门槛：得分 ≥ `max(1.8, 最高分 × 0.45)`，最多注入 `--top-k` 条（默认 3）。
-- **高置信**（directive 条目中得分 ≥ 最高 directive 分的 0.8）：标注 `[必须]`，并注入「默认委派原则」——专家能力与原生能力重叠时默认委派给专家能力，仅在不可用、调用失败或成本明显更高时才自行处理。
-- **中置信**（其余命中）：标注 `[建议]`，仅供参考，不相关可忽略。
-- 若没有任何 directive 命中，则只输出建议式提示，不附加强制规则。
-
-## 路由模式
-
-每个条目有 `mode`，决定它如何参与路由：
-
-- `directive`（默认）：可被标 `[必须]`，参与默认委派规则。适合 MCP、可执行技能和任务型专家能力。
-- `advisory`：只以 `[建议]` 出现，永不单独触发委派规则。适合行为准则、编码规范、评审建议等“随时适用但不该强制”的能力。
-- `off`：不参与路由，也不写入静态路由表。
-
-构建时会自动分类，用户无需逐条配置：
-
-- 描述匹配 `guidelines / best practices / conventions / principles / checklist / 行为准则 / 编码规范 / 最佳实践` 等 → `advisory`
-- 描述声明“仅斜杠命令 / 显式调用”（`only via slash`、`仅通过命令` 等）→ `off`
-- 插件根目录提供 `cap-index.json` 可精确声明，优先级高于自动分类：
-  ```json
-  { "routing": { "skill-name": "advisory", "*": "directive" } }
-  ```
-- `~/.cap-index/qoder/overrides.json` 中的 `mode` 优先级最高
+```bash
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT"
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT" --json
+```
 
 ## 数据
 
 - `~/.cap-index/qoder/`：索引、MCP 缓存、可选用户覆盖
 - `~/.cap-index/runtime/`：插件与 npm CLI 共用的运行时
-- 不保存 MCP 的 env / headers / 凭据
+- 第三方描述清洗后入库；不保存 MCP 的 env / headers / 凭据
 
 ## 定制
 
@@ -74,12 +61,24 @@ qodercli --plugin-dir <本目录> -p "帮我做个PPT"
 node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" build --client qoder --refresh
 ```
 
-## 0.3.0 变更
+`[必须]` 默认只在最高分条目同时满足分数、领先幅度与证据门槛时出现，最多一条。可在用户覆盖中调整：
 
-- 新增 `directive` / `advisory` / `off` 路由模式、自动分类与 `cap-index.json` 作者声明
-- 补全 MIT 许可证与市场元数据
-- 改进 MCP 降级日志：明确缓存回退、不可达影响和重试命令
-- 新增 `docs/AUTHORING.md` 中英双语作者与维护者文档
+```json
+{
+  "version": 1,
+  "routing": { "must": "trusted-only" }
+}
+```
+
+`must` 可取 `trusted-only`（默认）、`always`、`never`；环境变量 `CAP_INDEX_MUST` 优先。
+
+## 0.4.0 变更
+
+- 新增内置中英同义词 / 别名层，作为软触发词参与召回，不参与 `[必须]` 计分。
+- 英文触发词支持词级弹性匹配，允许少量间隔词；MCP 工具增加“动作 + 对象”关键词。
+- 新增具体度抑制与 2.4 阈值上限，降低同义命中带来的重复路由。
+- 增加代码评审文档类负向守卫，并补充固定集 / 盲测 / 85 项 selftest。
+- 已知边界：`slides` 与 `Presentations` 等同一输出形态的替代能力仍可能同时注入；`[必须]` 的盲测标注口径仍在评估中。
 
 ## 卸载
 

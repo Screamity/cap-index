@@ -1,6 +1,6 @@
 ---
 name: cap-index
-description: Inspect, rebuild, or troubleshoot the capability routing index. Use when the user asks which skills or MCP tools are available, when a newly installed skill/MCP server is not being suggested, or when capability routes look stale or missing.
+description: Capability routing index inspection, rebuild, and troubleshooting. Use when the user asks which skills or MCP tools are available, when a newly installed skill/MCP server is not being suggested, or when capability routes look stale or missing.
 ---
 
 # Cap Index

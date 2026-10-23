@@ -1,0 +1,16 @@
+{
+  "name": "cap-index",
+  "displayName": "Cap Index",
+  "version": "0.4.0",
+  "description": "Per-prompt capability routing: match each request against installed skills and MCP servers, and inject only the routes that are relevant.",
+  "license": "MIT",
+  "keywords": [
+    "qoder-plugin",
+    "skills",
+    "mcp",
+    "routing",
+    "capability-discovery"
+  ],
+  "skills": "./skills/",
+  "commands": "./commands"
+}
