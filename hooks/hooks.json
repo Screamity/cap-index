@@ -1,7 +1,24 @@
 {
-  "description": "cap-index per-prompt capability routing (requires Node.js 18+)",
+  "description": "cap-index capability catalog and index refresh (requires Node.js 18+)",
   "hooks": {
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${QODER_PLUGIN_ROOT}/cap-index.bundle.mjs",
+              "hook",
+              "session-start",
+              "--client",
+              "qoder"
+            ],
+            "name": "cap-index-catalog",
+            "timeout": 8
+          }
+        ]
+      },
       {
         "async": true,
         "hooks": [
@@ -19,25 +36,6 @@
             ],
             "name": "cap-index-refresh",
             "timeout": 90
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node",
-            "args": [
-              "${QODER_PLUGIN_ROOT}/cap-index.bundle.mjs",
-              "hook",
-              "user-prompt-submit",
-              "--client",
-              "qoder"
-            ],
-            "name": "cap-index-route",
-            "timeout": 5
           }
         ]
       }

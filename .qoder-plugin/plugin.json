@@ -1,14 +1,26 @@
 {
   "name": "cap-index",
   "displayName": "Cap Index",
-  "version": "0.4.0",
-  "description": "Per-prompt capability routing: match each request against installed skills and MCP servers, and inject only the routes that are relevant.",
+  "version": "0.6.1",
+  "description": "Inject a compact capability catalog, search installed skills and MCP servers, and advise native-vs-tool choices with artifact verification.",
+  "descriptionZh": "注入本机能力目录，检索已安装的 Skills 与 MCP，给出 native/工具建议并校验产物格式。",
   "license": "MIT",
+  "author": {
+    "name": "Screamity"
+  },
+  "homepage": "https://github.com/Screamity/cap-index",
+  "repository": "https://github.com/Screamity/cap-index",
+  "category": "Coding",
   "keywords": [
     "qoder-plugin",
     "skills",
     "mcp",
     "routing",
+    "capability-discovery"
+  ],
+  "tags": [
+    "skills",
+    "mcp",
     "capability-discovery"
   ],
   "skills": "./skills/",

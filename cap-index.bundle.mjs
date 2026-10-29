@@ -22684,7 +22684,7 @@ var SSEClientTransport = class {
 
 // cap-index.mjs
 var execFileP = promisify(execFile);
-var VERSION = "0.4.0";
+var VERSION = "0.6.1";
 var HOME = os.homedir();
 var ENTRY_FILE = fileURLToPath(import.meta.url);
 var ENTRY_DIR = path.dirname(ENTRY_FILE);
@@ -22693,7 +22693,7 @@ var RUNTIME_NAME = "cap-index.bundle.mjs";
 var BEGIN = "<!-- cap-index:begin (auto-generated; edit overrides.json and run build) -->";
 var END = "<!-- cap-index:end -->";
 var RE_BLOCK = /<!-- cap-index:begin[\s\S]*?<!-- cap-index:end -->/;
-var HOOK_NAMES = ["cap-index-route", "cap-index-refresh"];
+var HOOK_NAMES = ["cap-index-route", "cap-index-refresh", "cap-index-catalog"];
 var MCP_TIMEOUT = 8e3;
 var CACHE_TTL = 24 * 60 * 60 * 1e3;
 var MAX_TOKENS = 800;
@@ -22703,8 +22703,17 @@ var MUST_MIN_SCORE = 3;
 var MUST_MARGIN_RATIO = 1.25;
 var DEFAULT_MUST_MODE = "trusted-only";
 var MUST_MODES = ["always", "trusted-only", "never"];
+var PRECISION_MODES = ["balanced", "strict", "must-strict"];
 var MIN_INJECT_SCORE = 1.8;
 var RELATIVE_THRESHOLD = 0.45;
+var STRICT_MIN_SCORE = 2.2;
+var STRICT_RELATIVE_THRESHOLD = 0.55;
+var STRICT_MAX_THRESHOLD = 2.8;
+var STRICT_TOP_K = 2;
+var DISCUSSION_RE = /(?:讨论|评审|评估|比较|对比|区别|是什么|怎么理解|方案|策略|冲突|取舍|解释|说明一下|是否|要不要|该不该|为什么|原理|概念|提到|提及|关于|分析一下|看一下).{0,24}(?:pptx?|pdf|幻灯片|mcp|skill|工具|能力|架构|文档|报告|笔记|日程)/i;
+var EXPLICIT_EXTENSION_RE = /\.(?:pptx?|pdf|html?|md|docx?|xlsx?|csv|png|jpe?g|svg|drawio)\b/i;
+var EXPLICIT_ACTION_RE = /(?:做|制作|生成|创建|导出|转换|合并|拆分|识别|整理|写|编写|搭建|发布|部署|画|设计|审查|评审|封装|保存|另存|归档|记录|转成|做成|输出).{0,24}(?:pptx?|pdf|html|幻灯片|演示文稿|网页幻灯片|架构图|部署图|数据流图|依赖图|readme|技术文档|接口文档|使用指南|故障处置|手册|封面图|海报|插画|网站|站点|笔记|日程|报告|原型)/i;
+var EXPLICIT_ACTION_EN_RE = /(?:make|create|build|generate|export|convert|merge|split|ocr|write|draft|design|draw|review|audit|package|publish|deploy|save|record|archive).{0,32}(?:pptx?|pdf|html|slides?|deck|readme|docs?|documentation|architecture|diagram|poster|illustration|website|site|note|calendar|report|prototype)/i;
 var STRONG_SCORE_CAP = 2.4;
 var WEAK_SCORE_CAP = 1.2;
 var SOFT_ALIAS_FACTOR = 0.85;
@@ -22719,6 +22728,21 @@ var MAX_MCP_INSTRUCTIONS = 300;
 var MAX_ROUTE_CHARS = 150;
 var MAX_CONTEXT_CHARS = 600;
 var MAX_CONTEXT_TOKENS = 240;
+var CATALOG_TOKEN_BUDGET = 600;
+var FIND_LIMIT = 5;
+var SEARCH_K1 = 1.2;
+var SEARCH_B = 0.75;
+var DEFAULT_POLICY = {
+  version: 1,
+  classes: {
+    general: {
+      prefer: "native",
+      fallback: null,
+      qualityGate: ["meets task acceptance"],
+      reason: "No specialized capability is required."
+    }
+  }
+};
 var CX = null;
 var log = (...args) => {
   if (!CX?.quiet) console.log("[cap-index]", ...args);
@@ -23013,11 +23037,14 @@ function makeContext(opts) {
     dataHome,
     files: {
       md: path.join(dataHome, "capability-index.md"),
+      catalog: path.join(dataHome, "capability-catalog.md"),
       json: path.join(dataHome, "capabilities.json"),
+      roles: path.join(dataHome, "capability-roles.json"),
       cache: path.join(dataHome, "mcp-cache.json"),
       meta: path.join(dataHome, "meta.json"),
       lock: path.join(dataHome, ".build.lock"),
       userOverrides: path.join(dataHome, "overrides.json"),
+      policy: path.join(PROGRAM_ROOT, "defaults", "policy.json"),
       defaults: fs.existsSync(defaultsFile) ? defaultsFile : legacyDefaults,
       runtime: path.join(dataRoot, "runtime", RUNTIME_NAME),
       runtimeDefaults: path.join(dataRoot, "runtime", "defaults", "overrides.json"),
@@ -24936,7 +24963,7 @@ function buildMcpEntries(servers) {
   });
 }
 function mergeOverrides(base, extra) {
-  const out = { version: 1, entries: {}, groups: [], extraEntries: [] };
+  const out = { version: 1, entries: {}, groups: [], extraEntries: [], roles: {} };
   for (const source of [base, extra]) {
     if (!source || typeof source !== "object") continue;
     for (const [id, patch] of Object.entries(source.entries || {})) {
@@ -24951,6 +24978,13 @@ function mergeOverrides(base, extra) {
       const index = out.extraEntries.findIndex((item) => item.id === entry.id);
       if (index >= 0) out.extraEntries[index] = { ...out.extraEntries[index], ...entry };
       else out.extraEntries.push(entry);
+    }
+    for (const [className, ids] of Object.entries(source.roles || {})) {
+      const list2 = out.roles[className] || [];
+      for (const id of Array.isArray(ids) ? ids : []) {
+        if (typeof id === "string" && !list2.includes(id)) list2.push(id);
+      }
+      if (list2.length > 0) out.roles[className] = list2;
     }
   }
   return out;
@@ -25126,6 +25160,148 @@ function renderIndex(entries) {
 `;
   return { markdown, tokens: estimateTokens(markdown) };
 }
+var CATALOG_GROUPS = [
+  { name: "\u6587\u6863\u4E0E\u6F14\u793A", match: /presentations|pptx|slides|pdf-tools|docs-writer|office/ },
+  { name: "\u8C03\u7814\u4E0E\u5185\u5BB9", match: /deep-research|imagegen/ },
+  { name: "\u67B6\u6784\u4E0E\u4F9D\u8D56", match: /architecture|dependency|topology|c4model/ },
+  { name: "\u7F51\u7AD9\u4E0E\u53D1\u5E03", match: /\bsites\b|sites-/ },
+  { name: "\u4E2A\u4EBA\u4E0E\u77E5\u8BC6", match: /notes-sync|calendar-sync|ops-diary|ledger-keeper|qoder-qmind/ },
+  { name: "\u684C\u9762\u4E0E\u5E94\u7528", match: /computer-use/ },
+  { name: "\u5B89\u5168", match: /security-scan/ },
+  { name: "\u6269\u5C55\u4E0E\u914D\u7F6E", match: /agent-ext|skill-creator|agent-creator|hook-config|mcp-config|qoder-create-plugin|cap-index/ },
+  { name: "\u5DE5\u7A0B\u4E0E\u4EE3\u7801", match: /github|context7|browser|redis|code-review|batch|debug|loop|sdk|simplify|workflow|run-verify|karpathy|better-harness|quest/ }
+];
+var CAPABILITY_CLASS_RULES = [
+  { class: "security-scan", match: /security-scan|security scan|安全扫描|漏洞|密钥/i },
+  { class: "gui", match: /computer-use|desktop automation|本机应用|桌面应用|窗口操作/i },
+  { class: "testing", match: /run-verify|运行项目|验证改动|run tests/i },
+  { class: "browser", match: /browser-use|browser automation|浏览器|dom/i },
+  { class: "internal-knowledge", match: /qoder-qmind|knowledge base|知识库|内部资料/i },
+  { class: "raster-image", match: /imagegen|image generation|raster image|生成图片|封面图|海报|插画|配图/i },
+  { class: "architecture-diagram", match: /architecture-visualization|architecture|架构图|依赖图|部署拓扑|c4/i },
+  { class: "presentation", match: /presentations|pptx|powerpoint|幻灯片|演示文稿|汇报材料|slide deck/i },
+  { class: "sites", match: /qoder sites|sites-|建站|网站|站点|landing page|website/i },
+  { class: "docs-lookup", match: /context7|official docs|api reference|官方文档|api 文档|sdk 文档/i },
+  { class: "code-review", match: /code-review|代码审查|代码评审/i },
+  { class: "research", match: /deep-research|research|调研|研究报告|竞品/i },
+  { class: "redis", match: /redis|rqe|语义缓存/i }
+];
+var TASK_CLASS_RULES = [
+  { class: "security-scan", match: /安全扫描|security scan|(?:扫描|扫一遍|扫一下|检查|排查|找|查).{0,12}(?:密钥|漏洞|泄露|secret|vulnerab|credential)|(?:密钥|漏洞|泄露).{0,12}(?:扫描|检查|排查)/i },
+  { class: "gui", match: /computer-use|desktop automation|桌面自动化|桌面应用|本机应用|窗口操作|打开.{0,12}(?:窗口|应用|软件)/i },
+  { class: "testing", match: /运行项目|跑.{0,6}项目|跑测试|运行测试|test suite|run (?:the )?tests?|verify (?:the |this )?(?:fix|change|改动)|验证(?:一下)?改动/i },
+  { class: "browser", match: /浏览器|\bbrowser\b|browser-use|browser automation|本地预览页|\bdom\b|无障碍|页面元素|(?:点击|截图).{0,10}(?:页面|按钮|预览|链接)|(?:页面|按钮).{0,10}(?:点击|截图)/i },
+  { class: "internal-knowledge", match: /知识库|内部资料|knowledge base|qmind/i },
+  { class: "raster-image", match: /(?:生成|做一张|做张|画一张|画|设计|制作|出图|渲染|编辑|修改|改成|换成|替换|重绘|调整|优化|create|generate|design|make|edit|render|draw).{0,16}(?:封面|海报|插画|配图|图片|图像|头图|图标|logo|banner|头像|image|poster|illustration|png|jpe?g|icon)|(?:封面|海报|插画|配图|图片|图像|头图|图标|logo|banner|头像).{0,12}(?:生成|做一张|画|设计|制作|改成|换成|替换|重绘|调整|优化|generate|render|edit)/i },
+  { class: "architecture-diagram", match: /(?:画|绘制|生成|出图|建模|draw|create|make|generate).{0,10}(?:架构图|依赖图|拓扑|系统结构|c4|architecture|dependency)|(?:架构图|依赖图|部署拓扑|系统结构|c4 diagram)/i },
+  { class: "presentation", match: /(?:做成|整理成|转换成|做一份|做一个|制作|生成|整理|build|create|make|convert).{0,12}(?:pptx|ppt|幻灯片|演示文稿|汇报材料|slide deck|powerpoint|slides?)/i },
+  { class: "sites", match: /qoder sites|(?:建站|搭建|做一个|做个|创建|重做|部署|上线|发布|launch|build|create|deploy|publish).{0,16}(?:网站|站点|落地页|landing page|website|site)|(?:网站|站点|落地页|website).{0,10}(?:部署|上线|发布|deploy|publish)/i },
+  { class: "docs-lookup", match: /官方\s*(?:文档|api)|api\s*(?:文档|参考|reference)|sdk\s*文档|official docs|api reference|(?:查|查询|搜|找|看看|look up|what is|how to).{0,16}(?:文档|docs|api reference|official)/i },
+  { class: "code-review", match: /代码审查|代码评审|code review|(?:审查|评审).{0,6}代码|review.{0,16}(?:diff|pull request|\bpr\b|patch|code|changes?)/i },
+  { class: "research", match: /调研|研究报告|竞品分析|竞品|deep-research|research|multi-source/i },
+  { class: "redis", match: /redis|rqe|语义缓存/i }
+];
+var CLAUSE_SPLIT_RE = /[，,。；;、\n]+/;
+var NEGATION_RE = /不要|不用|无需|不必|不需要|用不着|别用|别把|别生成|别做|别建|别扫|别查|别跑|勿|禁止|避免|而不是|don't|do not|without|no need|not required/i;
+function capabilityClass(entry) {
+  const text = [
+    entry.id,
+    entry.fullName,
+    entry.purpose,
+    entry.description,
+    ...entry.triggers || [],
+    ...entry.keywords || [],
+    ...(entry.tools || []).map((tool) => `${tool.name || ""} ${tool.purpose || ""}`)
+  ].filter(Boolean).join(" ");
+  const hit = CAPABILITY_CLASS_RULES.find((rule) => rule.match.test(text));
+  return hit ? hit.class : "general";
+}
+function classifyTask(text) {
+  const value = oneLine(String(text || ""));
+  const hits = /* @__PURE__ */ new Set();
+  for (const clause of value.split(CLAUSE_SPLIT_RE)) {
+    const part = clause.trim();
+    if (!part || NEGATION_RE.test(part)) continue;
+    for (const rule of TASK_CLASS_RULES) {
+      if (rule.match.test(part)) hits.add(rule.class);
+    }
+  }
+  const matched = TASK_CLASS_RULES.filter((rule) => hits.has(rule.class)).map((rule) => rule.class);
+  return {
+    class: matched[0] || "general",
+    classes: matched
+  };
+}
+function catalogName(entry) {
+  const raw = String(entry.fullName || entry.id || "unknown").replace(/^group:/, "");
+  let label = safeLabel(raw, 48);
+  if (entryMode(entry) === "advisory") label += "[\u5EFA\u8BAE]";
+  if (entry.status === "unreachable") label += "[\u4E0D\u53EF\u7528]";
+  else if (entry.status === "stale-cache") label += "[\u7F13\u5B58]";
+  return label;
+}
+function catalogLabel(entry) {
+  const name = catalogName(entry);
+  const cleanedPurpose = sanitizeUntrusted(entry.purpose || "", 80).replace(/[。；;，,]+$/, "").replace(/[（(].*$/, "").replace(/\s*[—–]\s.*$/, "").trim();
+  const purpose = !hasInjection(cleanedPurpose) && cleanedPurpose ? cleanedPurpose.length > 18 ? `${cleanedPurpose.slice(0, 17)}\u2026` : cleanedPurpose : "";
+  const label = purpose ? `${name}(${purpose})` : name;
+  return label.length > 72 ? `${label.slice(0, 71)}\u2026` : label;
+}
+function renderCatalog(entries) {
+  const active = (entries || []).filter(
+    (entry) => entry && entryMode(entry) !== "off" && (entry.enabled !== false || ["unreachable", "stale-cache"].includes(entry.status))
+  );
+  const covered = /* @__PURE__ */ new Set();
+  for (const entry of active) {
+    for (const member of entry.members || []) covered.add(member);
+  }
+  const visible = active.filter(
+    (entry) => !covered.has(entry.fullName) || entry.id?.startsWith("family:") || entry.id?.startsWith("group:") || entry.kind === "skill_family" || entry.kind === "group"
+  );
+  const grouped = new Map(CATALOG_GROUPS.map((group) => [group.name, []]));
+  const other = [];
+  for (const entry of visible) {
+    const key = `${entry.id || ""} ${entry.fullName || ""} ${(entry.members || []).join(" ")}`.toLowerCase();
+    const group = CATALOG_GROUPS.find((candidate) => candidate.match.test(key));
+    (group ? grouped.get(group.name) : other).push(entry);
+  }
+  for (const list2 of grouped.values()) {
+    list2.sort((a, b) => (b.priority ?? 50) - (a.priority ?? 50) || String(a.id).localeCompare(String(b.id)));
+  }
+  other.sort((a, b) => (b.priority ?? 50) - (a.priority ?? 50) || String(a.id).localeCompare(String(b.id)));
+  const header = '[cap-index] \u672C\u673A\u80FD\u529B\u76EE\u5F55\uFF08\u4EC5\u4F9B\u53C2\u8003\uFF09\u3002\u7EC6\u8282\uFF1Acap-index find "<\u9700\u6C42>"\uFF1B\u4EFB\u52A1\u5F00\u59CB\u524D\u53EF\u8FD0\u884C cap-index decide "<\u4EFB\u52A1>" \u83B7\u53D6\u5EFA\u8BAE\u6216\u5019\u9009\u80FD\u529B\u3002';
+  const buildLines = (limit) => {
+    const lines2 = [];
+    for (const group of CATALOG_GROUPS) {
+      const list2 = grouped.get(group.name);
+      if (!list2 || list2.length === 0) continue;
+      const shown = [
+        ...list2.slice(0, limit).map(catalogLabel),
+        ...list2.slice(limit).map(catalogName)
+      ];
+      lines2.push(`- ${group.name}\uFF1A${shown.join("\u3001")}`);
+    }
+    if (other.length > 0) {
+      const shown = [
+        ...other.slice(0, limit).map(catalogLabel),
+        ...other.slice(limit).map(catalogName)
+      ];
+      lines2.push(`- \u5176\u4ED6\uFF1A${shown.join("\u3001")}`);
+    }
+    if (lines2.length === 0) lines2.push("- \u6682\u65E0\u53EF\u7528\u80FD\u529B");
+    return lines2;
+  };
+  let lines = buildLines(6);
+  for (const limit of [5, 4, 3, 2, 1]) {
+    if (estimateTokens([header, ...lines].join("\n")) <= CATALOG_TOKEN_BUDGET) break;
+    lines = buildLines(limit);
+  }
+  while (estimateTokens([header, ...lines].join("\n")) > CATALOG_TOKEN_BUDGET && lines.length > 3) {
+    lines.pop();
+  }
+  const markdown = [header, ...lines].join("\n");
+  return { markdown, tokens: estimateTokens(markdown), truncated: lines.length < buildLines(4).length };
+}
 function resolveTarget() {
   return path.resolve(CX.target);
 }
@@ -25151,7 +25327,9 @@ function publicEntry(entry) {
     id: entry.id,
     kind: entry.kind,
     fullName: entry.fullName,
+    class: entry.class || capabilityClass(entry),
     purpose: entry.purpose,
+    description: sanitizeUntrusted(entry.description || "", 1200),
     triggers: entry.triggers || [],
     keywords: entry.keywords || [],
     weakKeywords: entry.weakKeywords || [],
@@ -25167,7 +25345,7 @@ function publicEntry(entry) {
   if (entry.members) out.members = entry.members;
   if (entry.tools) out.tools = entry.tools;
   if (entry.status) out.status = entry.status;
-  if (entry.notFor) out.notFor = entry.notFor;
+  if (entry.notFor) out.notFor = Array.isArray(entry.notFor) ? entry.notFor : [String(entry.notFor)];
   if (entry.trust) out.trust = entry.trust;
   return out;
 }
@@ -25180,18 +25358,57 @@ function publicServer(server) {
     error: server.error
   };
 }
+function buildRoles(entries, overrides = {}) {
+  const forced = /* @__PURE__ */ new Map();
+  for (const [className, ids] of Object.entries(overrides.roles || {})) {
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (typeof id === "string") forced.set(id, className);
+    }
+  }
+  const classes = {};
+  for (const entry of entries) {
+    if (!entry || entry.enabled === false || entryMode(entry) === "off") continue;
+    const className = forced.get(entry.id) || entry.class || capabilityClass(entry);
+    const available = !(entry.kind === "mcp_server" && entry.status === "unreachable");
+    const role = {
+      id: entry.id,
+      fullName: entry.fullName,
+      kind: entry.kind,
+      status: entry.status || null,
+      mode: entryMode(entry),
+      priority: entry.priority ?? 50,
+      available,
+      degraded: entry.kind === "mcp_server" && entry.status === "stale-cache"
+    };
+    (classes[className] ||= []).push(role);
+  }
+  for (const list2 of Object.values(classes)) {
+    list2.sort(
+      (a, b) => Number(b.available) - Number(a.available) || b.priority - a.priority || String(a.id).localeCompare(String(b.id))
+    );
+  }
+  return {
+    version: 1,
+    client: CX?.client || "qoder",
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    classes
+  };
+}
 async function persist(markdown, entries, servers, cache, target, staticWritten) {
   await ensureDir(CX.dataHome);
   const builtAt = (/* @__PURE__ */ new Date()).toISOString();
+  const publicEntries = entries.map(publicEntry);
+  const catalog = renderCatalog(publicEntries);
+  const roles = buildRoles(publicEntries, loadOverrides());
   const json = {
-    version: 2,
+    version: 3,
     client: CX.client,
     builtAt,
-    entries: entries.map(publicEntry),
+    entries: publicEntries,
     mcpServers: servers.map(publicServer)
   };
   const meta2 = {
-    version: 2,
+    version: 3,
     client: CX.client,
     builtAt,
     counts: {
@@ -25199,18 +25416,25 @@ async function persist(markdown, entries, servers, cache, target, staticWritten)
       servers: servers.length,
       routes: entries.filter((entry) => entry.enabled !== false).length
     },
+    catalogTokens: catalog.tokens,
+    roleClasses: Object.keys(roles.classes).length,
     target: staticWritten ? target : null
   };
   await fsp.writeFile(CX.files.md, markdown, "utf8");
+  await writeFileAtomic(CX.files.catalog, `${catalog.markdown}
+`);
+  await writeFileAtomic(CX.files.roles, `${JSON.stringify(roles, null, 2)}
+`);
   await writeFileAtomic(CX.files.json, `${JSON.stringify(json, null, 2)}
 `);
   await writeFileAtomic(CX.files.cache, `${JSON.stringify(cache, null, 2)}
 `);
   await writeFileAtomic(CX.files.meta, `${JSON.stringify(meta2, null, 2)}
 `);
+  return catalog;
 }
 function stalenessFiles() {
-  const files = [CX.files.userOverrides, CX.files.defaults, CX.settingsFile];
+  const files = [CX.files.userOverrides, CX.files.defaults, CX.files.policy, CX.settingsFile];
   if (CX.client === "qoder") {
     files.push(
       path.join(CX.qoderDir, "plugins", "installed_plugins_v2.json"),
@@ -25295,7 +25519,24 @@ function spawnBackgroundBuild() {
     }
   }
 }
-async function syncRuntime() {
+function versionParts(value) {
+  return String(value || "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+}
+function compareVersions(a, b) {
+  const left = versionParts(a);
+  const right = versionParts(b);
+  for (let index = 0; index < 3; index += 1) {
+    if ((left[index] || 0) !== (right[index] || 0)) return (left[index] || 0) - (right[index] || 0);
+  }
+  return 0;
+}
+function isDowngrade(sourceVersion, targetVersion) {
+  return Boolean(sourceVersion && targetVersion) && compareVersions(sourceVersion, targetVersion) < 0;
+}
+function sourceVersionOf(text) {
+  return /(?:const|var|let)\s+VERSION\s*=\s*["']([0-9]+\.[0-9]+\.[0-9]+)["']/.exec(String(text || ""))?.[1] || null;
+}
+async function syncRuntime(opts = {}) {
   const source = entryPath();
   if (!/(^|[\\/])(cap-index\.bundle\.mjs|cap-index\.mjs)$/.test(source)) return false;
   if (!["cap-index.bundle.mjs", "cap-index.mjs"].includes(path.basename(source))) return false;
@@ -25303,9 +25544,18 @@ async function syncRuntime() {
   if (!/cap-index\.bundle\.mjs$/.test(source) && !/[\\/]bin[\\/]/.test(source)) return false;
   const sourceText = await fsp.readFile(source, "utf8");
   const defaultsText = fs.existsSync(CX.files.defaults) ? await fsp.readFile(CX.files.defaults, "utf8") : "";
-  const sourceHash = sha(`${sourceText}\0${defaultsText}`);
+  const sourcePolicy = path.join(PROGRAM_ROOT, "defaults", "policy.json");
+  const policyText = fs.existsSync(sourcePolicy) ? await fsp.readFile(sourcePolicy, "utf8") : "";
+  const sourceHash = sha(`${sourceText}\0${defaultsText}\0${policyText}`);
   const runtimeMeta = readJson(CX.files.runtimeMeta, null);
   if (runtimeMeta?.hash === sourceHash && fs.existsSync(CX.files.runtime)) return false;
+  const sourceVersion = sourceVersionOf(sourceText);
+  if (opts.noDowngrade && isDowngrade(sourceVersion, runtimeMeta?.version)) {
+    if (process.env.CAP_INDEX_DEBUG === "1") {
+      console.error(`[cap-index] \u8DF3\u8FC7 runtime \u964D\u7EA7\uFF1A${runtimeMeta.version} \u2192 ${sourceVersion}`);
+    }
+    return false;
+  }
   await ensureDir(path.dirname(CX.files.runtime));
   const tmp = `${CX.files.runtime}.${process.pid}.tmp`;
   await fsp.writeFile(tmp, sourceText, "utf8");
@@ -25313,6 +25563,11 @@ async function syncRuntime() {
   if (fs.existsSync(CX.files.defaults)) {
     await ensureDir(path.dirname(CX.files.runtimeDefaults));
     await fsp.copyFile(CX.files.defaults, CX.files.runtimeDefaults);
+  }
+  if (fs.existsSync(sourcePolicy)) {
+    const runtimePolicy = path.join(CX.dataRoot, "runtime", "defaults", "policy.json");
+    await ensureDir(path.dirname(runtimePolicy));
+    await fsp.copyFile(sourcePolicy, runtimePolicy);
   }
   await ensureDir(path.join(CX.dataRoot, "bin"));
   const cmd = [
@@ -25347,7 +25602,7 @@ async function build(opts) {
   const previousQuiet = CX.quiet;
   if (opts.quiet) CX.quiet = true;
   try {
-    if (opts.syncRuntime) await syncRuntime();
+    if (opts.syncRuntime) await syncRuntime({ noDowngrade: Boolean(opts.ifStale) });
     if (opts.ifStale && !indexIsStale(opts.staleHours)) {
       log("\u7D22\u5F15\u4ECD\u65B0\u9C9C\uFF0C\u8DF3\u8FC7\u91CD\u5EFA");
       return { skipped: true };
@@ -25363,11 +25618,11 @@ async function build(opts) {
     if (opts.staticBlock) {
       injection = await injectBlock(markdown, target, opts.dryRun);
     }
-    if (!opts.dryRun) await persist(markdown, entries, data.servers, data.cache, target, Boolean(opts.staticBlock));
+    const persisted = !opts.dryRun ? await persist(markdown, entries, data.servers, data.cache, target, Boolean(opts.staticBlock)) : null;
     const activeEntries = entries.filter((entry) => entry.enabled !== false && entryMode(entry) !== "off");
     const advisoryCount = activeEntries.filter((entry) => entryMode(entry) === "advisory").length;
     log(
-      `skill ${data.skills.length} \u4E2A\uFF0CMCP server ${data.servers.length} \u4E2A\uFF0C\u8DEF\u7531\u6761\u76EE ${activeEntries.length} \u6761\uFF08advisory ${advisoryCount}\uFF09\uFF0C\u7EA6 ${tokens} tokens`
+      `skill ${data.skills.length} \u4E2A\uFF0CMCP server ${data.servers.length} \u4E2A\uFF0C\u8DEF\u7531\u6761\u76EE ${activeEntries.length} \u6761\uFF08advisory ${advisoryCount}\uFF09\uFF0C\u7EA6 ${tokens} tokens` + (persisted ? `\uFF1B\u80FD\u529B\u76EE\u5F55\u7EA6 ${persisted.tokens} tokens` : "")
     );
     for (const warning of data.warnings) log(`\u63D0\u793A\uFF1A${warning}`);
     for (const server of data.servers) {
@@ -25471,6 +25726,843 @@ async function list(opts) {
     await persist(markdown, entries, data.servers, data.cache, resolveTarget(), false);
   }
   return entries;
+}
+function runCatalog(opts) {
+  const index = readJson(CX.files.json, null);
+  if (!index?.entries) {
+    log("\u5C1A\u672A\u751F\u6210\u7D22\u5F15\uFF0C\u8BF7\u5148\u8FD0\u884C build");
+    process.exitCode = 1;
+    return;
+  }
+  const catalog = renderCatalog(index.entries);
+  if (opts.json) {
+    console.log(JSON.stringify({ version: 1, client: CX.client, tokens: catalog.tokens, text: catalog.markdown }, null, 2));
+    return;
+  }
+  console.log(catalog.markdown);
+}
+function loadPolicy() {
+  const base = readJson(CX.files.policy, null);
+  const user = readJson(CX.files.userOverrides, null)?.policy;
+  const policy = base?.classes ? base : DEFAULT_POLICY;
+  return {
+    version: 1,
+    classes: {
+      ...policy.classes || {},
+      ...user?.classes || {}
+    }
+  };
+}
+function loadRoles() {
+  const stored = readJson(CX.files.roles, null);
+  if (stored?.classes) return stored;
+  const index = readJson(CX.files.json, null);
+  if (!index?.entries) return { version: 1, client: CX.client, classes: {} };
+  return buildRoles(index.entries, loadOverrides());
+}
+var CHECK_MIN_SCORE = 2;
+var CHECK_LIMIT = 3;
+function decideCheckCandidates(task, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return [];
+  const ranked = rankEntries(task, entries, 8);
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const item of ranked) {
+    if (item.score < CHECK_MIN_SCORE) break;
+    const cls = capabilityClass(item.entry);
+    if (cls === "general" || seen.has(cls)) continue;
+    seen.add(cls);
+    out.push({
+      id: item.entry.id,
+      fullName: item.entry.fullName,
+      class: cls,
+      score: Number(item.score.toFixed(2))
+    });
+    if (out.length >= CHECK_LIMIT) break;
+  }
+  return out;
+}
+function decideTask(task, policy, roles, entries = []) {
+  const classification = classifyTask(task);
+  const className = classification.class;
+  const classPolicy = policy.classes?.[className] || policy.classes?.general || DEFAULT_POLICY.classes.general;
+  const candidates = (roles.classes?.[className] || []).filter((role) => role.available);
+  const preferred = className === "general" ? null : candidates[0] || null;
+  const check2 = className === "general" ? decideCheckCandidates(task, entries) : [];
+  let recommendation = "native";
+  let fallback = null;
+  let confidence = "medium";
+  let reason = classPolicy.reason || "";
+  if (className === "general") {
+    if (check2.length > 0) {
+      recommendation = "unclear";
+      confidence = "low";
+      reason = "\u672A\u8BC6\u522B\u5230\u660E\u786E\u80FD\u529B\u4FE1\u53F7\uFF1B\u5148\u786E\u8BA4\u5019\u9009\u80FD\u529B\u662F\u5426\u9002\u7528\uFF0C\u518D\u51B3\u5B9A native \u6216\u5DE5\u5177\u3002";
+    } else {
+      recommendation = "native";
+      confidence = "medium";
+      reason = classPolicy.reason || "\u6CA1\u6709\u8BC6\u522B\u5230\u4E13\u7528\u80FD\u529B\u5019\u9009\uFF0C\u4F7F\u7528 native\u3002";
+    }
+  } else if (classPolicy.prefer === "tool") {
+    if (preferred) {
+      recommendation = "tool";
+      fallback = classPolicy.fallback || null;
+      confidence = className === "sites" ? "medium" : "high";
+      reason = classPolicy.reason || `\u4F18\u5148\u4F7F\u7528 ${className} \u80FD\u529B\u3002`;
+    } else if (classPolicy.fallback === "blocked") {
+      recommendation = "blocked";
+      confidence = "high";
+      reason = `\u6CA1\u6709\u53EF\u7528\u7684 ${className} \u80FD\u529B\uFF1B\u65E0\u6CD5\u53EF\u9760\u5B8C\u6210\uFF0C\u5148\u8BF4\u660E\u9650\u5236\u3002`;
+    } else {
+      recommendation = "native";
+      confidence = "low";
+      reason = `\u6CA1\u6709\u53EF\u7528\u7684 ${className} \u80FD\u529B\uFF1B\u5148\u7528 native\uFF0C\u4F46\u5FC5\u987B\u901A\u8FC7\u8D28\u91CF\u95E8\u69DB\u3002`;
+    }
+  } else if (classPolicy.prefer === "native-first") {
+    recommendation = "native";
+    fallback = preferred ? "tool" : null;
+    confidence = preferred ? "high" : "medium";
+    reason = classPolicy.reason || `\u5148\u5C1D\u8BD5 native\uFF1B\u5931\u8D25\u518D\u5207 ${className} \u80FD\u529B\u3002`;
+  } else {
+    recommendation = "native";
+    confidence = "high";
+  }
+  return {
+    version: 1,
+    task,
+    taskClass: className,
+    matchedClasses: classification.classes,
+    recommendation,
+    preferredCapability: preferred ? {
+      id: preferred.id,
+      fullName: preferred.fullName,
+      kind: preferred.kind,
+      status: preferred.status
+    } : null,
+    candidates: candidates.map((role) => role.id),
+    check: check2,
+    fallback,
+    qualityGate: classPolicy.qualityGate || [],
+    requires: classPolicy.requires || null,
+    reason,
+    confidence
+  };
+}
+function runDecide(opts) {
+  const task = (opts.positionals || []).join(" ").trim();
+  if (!task) {
+    console.error('\u7528\u6CD5\uFF1Acap-index decide "<\u4EFB\u52A1>" [--json]');
+    process.exitCode = 2;
+    return;
+  }
+  const index = readJson(CX.files.json, null);
+  if (!index?.entries) {
+    log("\u5C1A\u672A\u751F\u6210\u7D22\u5F15\uFF0C\u8BF7\u5148\u8FD0\u884C build");
+    process.exitCode = 1;
+    return;
+  }
+  const result = decideTask(task, loadPolicy(), loadRoles(), index.entries);
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  const label = result.recommendation === "tool" ? "\u4F18\u5148\u4F7F\u7528\u5DE5\u5177" : result.recommendation === "blocked" ? "\u7F3A\u5C11\u53EF\u7528\u80FD\u529B" : result.recommendation === "unclear" ? "\u672A\u8BC6\u522B\u5230\u660E\u786E\u4FE1\u53F7\uFF1B\u5148\u786E\u8BA4\u5019\u9009\uFF0C\u518D\u51B3\u5B9A native \u6216\u5DE5\u5177" : result.recommendation === "native" && result.fallback === "tool" ? "\u5148\u7528 native\uFF1B\u5931\u8D25\u56DE\u9000\u5DE5\u5177" : "\u5148\u7528 native";
+  log(`\u4EFB\u52A1\u7C7B\u522B\uFF1A${result.taskClass}${result.matchedClasses.length > 1 ? `\uFF08\u540C\u65F6\u6D89\u53CA ${result.matchedClasses.join("\u3001")}\uFF09` : ""}`);
+  log(
+    `\u5EFA\u8BAE\uFF1A${label}${result.preferredCapability ? ` \u2192 ${result.preferredCapability.fullName}` : ""}`
+  );
+  if (result.check.length) {
+    log(`\u5019\u9009\uFF1A${result.check.map((item) => `${item.fullName} [${item.class}] ${item.score}`).join("\uFF1B")}`);
+  }
+  if (result.fallback) {
+    log(
+      `\u56DE\u9000\uFF1A${result.fallback === "tool" ? "\u6539\u7528\u4E13\u7528\u80FD\u529B" : result.fallback === "blocked" ? "\u4E0D\u53EF\u7528/\u9700\u5148\u83B7\u5F97\u80FD\u529B\u6216\u6743\u9650" : "\u6539\u7528 native"}`
+    );
+  }
+  if (result.qualityGate.length && result.taskClass !== "general") {
+    log(`\u8D28\u91CF\u95E8\u69DB\uFF1A${result.qualityGate.join("\uFF1B")}`);
+  }
+  if (result.requires) log(`\u4F9D\u8D56\uFF1A${result.requires}`);
+  log(`\u7406\u7531\uFF1A${result.reason}`);
+  log(`\u7F6E\u4FE1\u5EA6\uFF1A${result.confidence}`);
+}
+var SEARCH_STOP_EN = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "can",
+  "could",
+  "do",
+  "does",
+  "for",
+  "from",
+  "had",
+  "has",
+  "have",
+  "he",
+  "her",
+  "his",
+  "how",
+  "i",
+  "if",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "may",
+  "me",
+  "might",
+  "must",
+  "my",
+  "no",
+  "not",
+  "of",
+  "on",
+  "or",
+  "our",
+  "should",
+  "so",
+  "some",
+  "than",
+  "that",
+  "the",
+  "their",
+  "them",
+  "then",
+  "there",
+  "these",
+  "they",
+  "this",
+  "those",
+  "to",
+  "up",
+  "us",
+  "was",
+  "we",
+  "were",
+  "what",
+  "when",
+  "which",
+  "while",
+  "will",
+  "with",
+  "without",
+  "would",
+  "you",
+  "your",
+  "please",
+  "help",
+  "want",
+  "need",
+  "make",
+  "create",
+  "build",
+  "generate",
+  "write",
+  "draft",
+  "design",
+  "draw",
+  "produce",
+  "use",
+  "using",
+  "used",
+  "also",
+  "just",
+  "like",
+  "about",
+  "after",
+  "before",
+  "during",
+  "over",
+  "under",
+  "between",
+  "through",
+  "within",
+  "one",
+  "two",
+  "three",
+  "first",
+  "next",
+  "last",
+  "new",
+  "current",
+  "simple",
+  "quick",
+  "small",
+  "large",
+  "full",
+  "final",
+  "able",
+  "available",
+  "based",
+  "specific",
+  "general",
+  "common",
+  "various",
+  "several",
+  "many",
+  "much",
+  "more",
+  "most",
+  "any",
+  "all",
+  "other",
+  "same",
+  "own",
+  "via",
+  "per"
+]);
+var SEARCH_STOP_ZH = /* @__PURE__ */ new Set([
+  "\u7684",
+  "\u4E86",
+  "\u548C",
+  "\u4E0E",
+  "\u53CA",
+  "\u6216",
+  "\u5728",
+  "\u662F",
+  "\u6211",
+  "\u4F60",
+  "\u4ED6",
+  "\u5979",
+  "\u5B83",
+  "\u6211\u4EEC",
+  "\u4F60\u4EEC",
+  "\u4ED6\u4EEC",
+  "\u8FD9",
+  "\u90A3",
+  "\u8FD9\u4E2A",
+  "\u90A3\u4E2A",
+  "\u4E00\u4E2A",
+  "\u4E00\u4EFD",
+  "\u4E00\u4E0B",
+  "\u8BF7",
+  "\u5E2E\u6211",
+  "\u60F3\u8981",
+  "\u9700\u8981",
+  "\u53EF\u4EE5",
+  "\u80FD\u591F",
+  "\u600E\u4E48",
+  "\u5982\u4F55",
+  "\u4EC0\u4E48",
+  "\u54EA\u4E9B",
+  "\u4EE5\u53CA",
+  "\u7136\u540E",
+  "\u518D",
+  "\u5E76",
+  "\u628A",
+  "\u5C06",
+  "\u5BF9",
+  "\u4E3A",
+  "\u7ED9",
+  "\u4ECE",
+  "\u5230",
+  "\u4E2D",
+  "\u4E0A",
+  "\u4E0B",
+  "\u91CC",
+  "\u5916",
+  "\u5C31",
+  "\u90FD",
+  "\u4E5F",
+  "\u8FD8",
+  "\u5F88",
+  "\u66F4",
+  "\u6700",
+  "\u4E00\u4E9B",
+  "\u8FD9\u4E9B",
+  "\u90A3\u4E9B",
+  "\u80FD",
+  "\u4F1A",
+  "\u8981",
+  "\u4E0D",
+  "\u6CA1",
+  "\u6CA1\u6709",
+  "\u4E0D\u7528",
+  "\u4E0D\u8981",
+  "\u522B",
+  "\u53EA",
+  "\u4EC5",
+  "\u5176\u4ED6",
+  "\u53E6\u5916",
+  "\u5982\u679C",
+  "\u56E0\u4E3A",
+  "\u6240\u4EE5",
+  "\u4F46\u662F",
+  "\u4E0D\u8FC7",
+  "\u800C\u4E14",
+  "\u6216\u8005",
+  "\u8FD8\u662F",
+  "\u5DF2\u7ECF",
+  "\u6B63\u5728",
+  "\u5C06\u8981",
+  "\u53EF\u80FD",
+  "\u5E94\u8BE5",
+  "\u5FC5\u987B",
+  "\u5C3D\u91CF",
+  "\u6309",
+  "\u6309\u7167",
+  "\u6839\u636E",
+  "\u901A\u8FC7",
+  "\u4F7F\u7528",
+  "\u7528",
+  "\u505A",
+  "\u505A\u6210",
+  "\u5236\u4F5C",
+  "\u751F\u6210",
+  "\u521B\u5EFA",
+  "\u5199",
+  "\u7F16\u5199",
+  "\u6574\u7406",
+  "\u5904\u7406",
+  "\u5B8C\u6210",
+  "\u4EA4\u4ED8",
+  "\u8F93\u51FA",
+  "\u63D0\u4F9B",
+  "\u5E2E\u52A9",
+  "\u652F\u6301",
+  "\u4E1C\u897F",
+  "\u7ED3\u679C",
+  "\u65B9\u5F0F",
+  "\u65B9\u6CD5",
+  "\u65B9\u6848",
+  "\u6D41\u7A0B",
+  "\u6B65\u9AA4",
+  "\u60C5\u51B5",
+  "\u4EFB\u52A1",
+  "\u9879\u76EE",
+  "\u5DE5\u4F5C",
+  "\u529F\u80FD",
+  "\u80FD\u529B",
+  "\u5DE5\u5177",
+  "\u670D\u52A1",
+  "\u5E73\u53F0",
+  "\u4EA7\u54C1",
+  "\u7528\u6237",
+  "\u5BA2\u6237",
+  "\u56E2\u961F",
+  "\u516C\u53F8",
+  "\u4E1A\u52A1",
+  "\u573A\u666F",
+  "\u76EE\u6807",
+  "\u8BA1\u5212",
+  "\u65F6\u95F4",
+  "\u4ECA\u5929",
+  "\u660E\u5929",
+  "\u6628\u5929",
+  "\u672C\u5468",
+  "\u4E0B\u5468",
+  "\u73B0\u5728",
+  "\u76EE\u524D",
+  "\u4EE5\u540E",
+  "\u4E4B\u524D",
+  "\u4E4B\u540E",
+  "\u540C\u65F6",
+  "\u5206\u522B",
+  "\u4E00\u8D77",
+  "\u6BCF\u4E2A",
+  "\u6240\u6709",
+  "\u4EFB\u4F55",
+  "\u66F4\u591A",
+  "\u66F4\u5C11",
+  "\u975E\u5E38",
+  "\u6BD4\u8F83",
+  "\u7279\u522B",
+  "\u4E3B\u8981",
+  "\u91CD\u8981",
+  "\u7B80\u5355",
+  "\u590D\u6742",
+  "\u5FEB\u901F",
+  "\u6162\u6162",
+  "\u76F4\u63A5",
+  "\u81EA\u52A8",
+  "\u624B\u52A8",
+  "\u521A\u521A",
+  "\u9A6C\u4E0A",
+  "\u7ACB\u5373",
+  "\u6700\u540E",
+  "\u9996\u5148",
+  "\u5176\u6B21",
+  "\u63A5\u7740",
+  "\u6B64\u5916",
+  "\u4F8B\u5982",
+  "\u6BD4\u5982",
+  "\u5305\u62EC",
+  "\u9664\u4E86",
+  "\u5173\u4E8E",
+  "\u5BF9\u4E8E",
+  "\u5229\u7528",
+  "\u501F\u52A9",
+  "\u57FA\u4E8E",
+  "\u9488\u5BF9",
+  "\u9762\u5411",
+  "\u56F4\u7ED5",
+  "\u4E3A\u4E86",
+  "\u4EE5\u4FBF",
+  "\u907F\u514D",
+  "\u786E\u4FDD",
+  "\u4FDD\u8BC1",
+  "\u5C3D\u53EF\u80FD",
+  "\u81F3\u5C11",
+  "\u6700\u591A",
+  "\u4E0D\u8D85\u8FC7",
+  "\u63A7\u5236\u5728",
+  "\u5927\u7EA6",
+  "\u5DE6\u53F3",
+  "\u4EE5\u4E0A",
+  "\u4EE5\u4E0B",
+  "\u4EE5\u5185",
+  "\u4E4B\u5916",
+  "\u4E4B\u95F4",
+  "\u91CC\u9762",
+  "\u5916\u9762",
+  "\u4E0A\u9762",
+  "\u4E0B\u9762",
+  "\u8FD9\u91CC",
+  "\u90A3\u91CC",
+  "\u54EA\u91CC",
+  "\u8C01",
+  "\u54EA",
+  "\u591A\u5C11",
+  "\u51E0",
+  "\u7B2C\u4E00",
+  "\u7B2C\u4E8C",
+  "\u7B2C\u4E09"
+]);
+function stemSearchToken(token) {
+  if (token.length <= 3) return token;
+  if (token.endsWith("ies")) return `${token.slice(0, -3)}y`;
+  if (token.endsWith("sses")) return token.slice(0, -2);
+  if (token.endsWith("ing") && token.length > 5) return token.slice(0, -3);
+  if (token.endsWith("ed") && token.length > 4) return token.slice(0, -2);
+  if (token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1);
+  return token;
+}
+function searchTokens(value) {
+  const text = oneLine(String(value || "")).normalize("NFKC").toLowerCase();
+  const out = /* @__PURE__ */ new Set();
+  const add = (token) => {
+    const normalized = String(token || "").replace(/^[-_.]+|[-_.]+$/g, "");
+    if (!normalized || normalized.length < 2 || /^\d+$/.test(normalized)) return;
+    out.add(normalized);
+  };
+  for (const part of splitIdentifier(text)) {
+    for (const word of part.toLowerCase().match(/[a-z0-9+#.]+/g) || []) {
+      const token = word.replace(/^[-_.]+|[-_.]+$/g, "");
+      if (!token || SEARCH_STOP_EN.has(token)) continue;
+      if (token.length < 2 && !["c", "r", "go"].includes(token)) continue;
+      add(token);
+      const stem = stemSearchToken(token);
+      if (stem !== token) add(stem);
+    }
+  }
+  for (const run of text.match(/[\u4e00-\u9fff]+/g) || []) {
+    const pieces = run.length > 6 ? run.split(/[和与及或]/) : [run];
+    for (const piece of pieces) {
+      for (const size of [2, 3]) {
+        for (let index = 0; index + size <= piece.length; index += 1) {
+          const token = piece.slice(index, index + size);
+          if (!SEARCH_STOP_ZH.has(token)) add(token);
+        }
+      }
+      if (piece.length >= 2 && piece.length <= 8 && !SEARCH_STOP_ZH.has(piece)) add(piece);
+    }
+  }
+  return [...out].slice(0, 96);
+}
+function compactSearchText(value) {
+  return String(value || "").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}+#.]+/gu, "");
+}
+function searchDoc(entry) {
+  const fields = [
+    [entry.fullName || "", 3],
+    [entry.purpose || "", 2.5],
+    [(entry.triggers || []).join(" "), 2.5],
+    [entry.description || "", 1],
+    [(entry.keywords || []).join(" "), 1.2],
+    [(entry.weakKeywords || []).join(" "), 0.3],
+    [(entry.members || []).join(" "), 1.5],
+    [(entry.tools || []).map((tool) => `${tool.name || ""} ${tool.purpose || ""}`).join(" "), 1.5],
+    [(entry.tools || []).map((tool) => tool.purpose || "").join(" "), 0.8]
+  ];
+  const tf = /* @__PURE__ */ new Map();
+  let length = 0;
+  for (const [text, weight] of fields) {
+    for (const token of searchTokens(text)) {
+      tf.set(token, (tf.get(token) || 0) + weight);
+      length += weight;
+    }
+  }
+  return { tf, length };
+}
+function rankEntries(query, entries, limit = FIND_LIMIT) {
+  const queryTokens = searchTokens(query);
+  if (queryTokens.length === 0) return [];
+  const docs = (entries || []).filter((entry) => entry && entry.enabled !== false && entryMode(entry) !== "off").map((entry) => ({ entry, ...searchDoc(entry) }));
+  if (docs.length === 0) return [];
+  const documentFrequency = /* @__PURE__ */ new Map();
+  for (const doc of docs) {
+    for (const token of doc.tf.keys()) {
+      documentFrequency.set(token, (documentFrequency.get(token) || 0) + 1);
+    }
+  }
+  const averageLength = docs.reduce((sum, doc) => sum + doc.length, 0) / docs.length || 1;
+  const queryCompact = compactSearchText(query);
+  const results = [];
+  for (const doc of docs) {
+    let score = 0;
+    const matched = [];
+    for (const token of queryTokens) {
+      const tf = doc.tf.get(token);
+      if (!tf) continue;
+      const df = documentFrequency.get(token) || 0;
+      const idf = Math.log(1 + (docs.length - df + 0.5) / (df + 0.5));
+      const norm = tf * (SEARCH_K1 + 1) / (tf + SEARCH_K1 * (1 - SEARCH_B + SEARCH_B * doc.length / averageLength));
+      score += idf * norm;
+      matched.push({ token, weight: idf * norm });
+    }
+    if (queryCompact.length >= 2) {
+      const phrases = [
+        doc.entry.fullName,
+        doc.entry.purpose,
+        ...doc.entry.triggers || [],
+        ...doc.entry.keywords || [],
+        ...doc.entry.members || []
+      ];
+      for (const phrase of phrases) {
+        const compact = compactSearchText(phrase);
+        if (!compact) continue;
+        if (compact.includes(queryCompact)) {
+          score += 2.5;
+          break;
+        }
+        if (queryCompact.includes(compact) && compact.length >= 2) {
+          score += 1.5;
+          break;
+        }
+      }
+    }
+    let notForHit = "";
+    const notForList = Array.isArray(doc.entry.notFor) ? doc.entry.notFor : doc.entry.notFor ? [String(doc.entry.notFor)] : [];
+    for (const statement of notForList) {
+      const compact = compactSearchText(statement);
+      if (compact.length >= 2 && (queryCompact.includes(compact) || compact.includes(queryCompact))) {
+        notForHit = statement;
+        break;
+      }
+    }
+    if (notForHit) score *= 0.35;
+    if (doc.entry.kind === "mcp_server" && doc.entry.status === "unreachable") score *= 0.4;
+    else if (doc.entry.kind === "mcp_server" && doc.entry.status === "stale-cache") score *= 0.7;
+    if (score > 0) {
+      results.push({
+        entry: doc.entry,
+        score,
+        matched: matched.sort((a, b) => b.weight - a.weight).slice(0, 3),
+        notForHit
+      });
+    }
+  }
+  return results.sort(
+    (a, b) => b.score - a.score || (b.entry.priority ?? 50) - (a.entry.priority ?? 50) || String(a.entry.id).localeCompare(String(b.entry.id))
+  ).slice(0, Math.max(1, limit));
+}
+function runFind(opts) {
+  const query = (opts.positionals || []).join(" ").trim();
+  if (!query) {
+    console.error('\u7528\u6CD5\uFF1Acap-index find "<\u9700\u6C42>" [--json] [--limit 5]');
+    process.exitCode = 2;
+    return;
+  }
+  const index = readJson(CX.files.json, null);
+  if (!index?.entries) {
+    log("\u5C1A\u672A\u751F\u6210\u7D22\u5F15\uFF0C\u8BF7\u5148\u8FD0\u884C build");
+    process.exitCode = 1;
+    return;
+  }
+  const limit = Math.max(1, Math.min(20, Number(opts.limit) || FIND_LIMIT));
+  const ranked = rankEntries(query, index.entries, limit);
+  const payload = {
+    version: 1,
+    client: CX.client,
+    builtAt: index.builtAt || null,
+    query,
+    results: ranked.map((item) => {
+      const notForList = Array.isArray(item.entry.notFor) ? item.entry.notFor : item.entry.notFor ? [String(item.entry.notFor)] : [];
+      return {
+        id: item.entry.id,
+        fullName: item.entry.fullName,
+        kind: item.entry.kind,
+        purpose: item.entry.purpose || "",
+        triggers: (item.entry.triggers || []).slice(0, 5),
+        notFor: notForList.slice(0, 3),
+        status: item.entry.status || (entryMode(item.entry) === "advisory" ? "advisory" : "on"),
+        target: sanitizeUntrusted(targetText(item.entry), 160),
+        score: Math.round(item.score * 100) / 100,
+        matched: item.matched.map((match) => match.token),
+        notForHit: item.notForHit || null
+      };
+    })
+  };
+  if (opts.json) {
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+  if (ranked.length === 0) {
+    log(`\u6CA1\u6709\u627E\u5230\u4E0E\u300C${query}\u300D\u5339\u914D\u7684\u80FD\u529B\u3002\u6362\u4E00\u79CD\u8BF4\u6CD5\uFF0C\u6216\u8FD0\u884C list \u67E5\u770B\u5168\u90E8\u6761\u76EE\u3002`);
+    return;
+  }
+  for (let index2 = 0; index2 < ranked.length; index2 += 1) {
+    const item = ranked[index2];
+    const entry = item.entry;
+    const status = entry.status || (entryMode(entry) === "advisory" ? "advisory" : "on");
+    log(`[${index2 + 1}] ${entry.fullName || entry.id} \xB7 ${entry.kind} \xB7 ${status}`);
+    const notForList = Array.isArray(entry.notFor) ? entry.notFor : entry.notFor ? [String(entry.notFor)] : [];
+    const purpose = sanitizeUntrusted(entry.purpose || "", 120).replace(/\s+/g, " ").trim();
+    if (purpose && !hasInjection(purpose)) log(`    \u7528\u9014\uFF1A${purpose}`);
+    if ((entry.triggers || []).length) log(`    \u9002\u7528\uFF1A${entry.triggers.slice(0, 4).join("\u3001")}`);
+    if (notForList.length) log(`    \u4E0D\u9002\u7528\uFF1A${notForList.slice(0, 2).join("\uFF1B")}`);
+    if (item.notForHit) log(`    \u6CE8\u610F\uFF1A\u672C\u6B21\u67E5\u8BE2\u547D\u4E2D\u4E86\u4E0D\u9002\u7528\u6761\u4EF6\uFF08${item.notForHit}\uFF09`);
+    log(`    \u5339\u914D\uFF1A${item.matched.map((match) => match.token).join("\u3001") || "\u2014"}`);
+    if (item.matched.length <= 1) log("    \u63D0\u793A\uFF1A\u5339\u914D\u8BC1\u636E\u8F83\u5F31\uFF1B\u8BF7\u7ED3\u5408\u80FD\u529B\u76EE\u5F55\u5224\u65AD\uFF0C\u5FC5\u8981\u65F6\u6362\u4E00\u79CD\u8BF4\u6CD5\u3002");
+    log(`    \u8C03\u7528\uFF1A${sanitizeUntrusted(targetText(entry), 160)}`);
+  }
+}
+function inferArtifactClass(target) {
+  let stat = null;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    return "file";
+  }
+  if (stat.isDirectory()) return "site";
+  const ext = path.extname(target).toLowerCase();
+  if (ext === ".pptx") return "presentation";
+  if (ext === ".pdf") return "pdf";
+  if ([".png", ".jpg", ".jpeg"].includes(ext)) return "raster-image";
+  if (ext === ".svg") return "svg";
+  if ([".html", ".htm"].includes(ext)) return "website";
+  return "file";
+}
+function verifyArtifact(target, className) {
+  const checks = [];
+  const add = (name, ok2, detail = "") => checks.push({ name, ok: ok2, detail });
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    return {
+      version: 1,
+      path: target,
+      class: className,
+      ok: false,
+      checks: [{ name: "exists", ok: false, detail: "not found" }],
+      reason: "artifact not found"
+    };
+  }
+  if (stat.isDirectory()) {
+    const index = path.join(target, "index.html");
+    const exists = fs.existsSync(index);
+    add("site-index", exists, index);
+    return {
+      version: 1,
+      path: target,
+      class: "site",
+      ok: exists,
+      checks,
+      reason: exists ? "directory contains index.html" : "missing index.html"
+    };
+  }
+  add("non-empty", stat.size > 0, `${stat.size} bytes`);
+  if (stat.size === 0) {
+    return { version: 1, path: target, class: className, ok: false, checks, reason: "empty file" };
+  }
+  const buffer = fs.readFileSync(target);
+  const head = buffer.subarray(0, 16);
+  const isZip = head[0] === 80 && head[1] === 75;
+  const isPng = head[0] === 137 && head[1] === 80 && head[2] === 78 && head[3] === 71;
+  const isJpg = head[0] === 255 && head[1] === 216 && head[2] === 255;
+  const sample = buffer.toString("latin1", 0, Math.min(buffer.length, 20 * 1024 * 1024));
+  const lower = sample.toLowerCase();
+  const ext = path.extname(target).toLowerCase();
+  switch (className) {
+    case "presentation":
+      add("extension", ext === ".pptx", ext);
+      add("zip-container", isZip, "PK");
+      add("ooxml-parts", sample.includes("[Content_Types].xml") && sample.includes("ppt/"), "content types + ppt/");
+      break;
+    case "raster-image":
+      add("extension", [".png", ".jpg", ".jpeg"].includes(ext), ext);
+      add("raster-magic", isPng || isJpg, isPng ? "PNG" : isJpg ? "JPEG" : "not raster");
+      break;
+    case "pdf":
+      add("extension", ext === ".pdf", ext);
+      add("pdf-magic", sample.startsWith("%PDF-"), "%PDF-");
+      break;
+    case "svg":
+      add("extension", ext === ".svg", ext);
+      add("svg-content", lower.includes("<svg"), "<svg");
+      break;
+    case "website":
+      add("extension", [".html", ".htm"].includes(ext), ext);
+      add("html-content", lower.includes("<html") || lower.includes("<!doctype"), "html/doctype");
+      break;
+    case "diagram":
+      if (ext === ".svg") {
+        add("extension", true, ext);
+        add("svg-content", lower.includes("<svg"), "<svg");
+      } else if ([".png", ".jpg", ".jpeg"].includes(ext)) {
+        add("extension", true, ext);
+        add("raster-magic", isPng || isJpg, isPng ? "PNG" : isJpg ? "JPEG" : "not raster");
+      } else if ([".html", ".htm"].includes(ext)) {
+        add("extension", true, ext);
+        add("html-content", lower.includes("<html") || lower.includes("<!doctype"), "html/doctype");
+      } else {
+        add("diagram-format", false, ext || "unknown");
+      }
+      break;
+    case "site":
+      add("site-file", [".html", ".htm"].includes(ext), ext);
+      break;
+    default:
+      add("file", true, "non-empty");
+      break;
+  }
+  const ok = checks.every((check2) => check2.ok);
+  return {
+    version: 1,
+    path: target,
+    class: className,
+    ok,
+    checks,
+    reason: ok ? "artifact matches expected format" : "artifact does not match expected format"
+  };
+}
+function runVerify(opts) {
+  const target = (opts.positionals || []).join(" ").trim();
+  if (!target) {
+    console.error('\u7528\u6CD5\uFF1Acap-index verify "<\u4EA7\u7269\u8DEF\u5F84>" [--class presentation|raster-image|pdf|svg|website|diagram|site] [--json]');
+    process.exitCode = 2;
+    return;
+  }
+  const className = opts.artifactClass || inferArtifactClass(target);
+  const result = verifyArtifact(target, className);
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    log(`${result.ok ? "\u901A\u8FC7" : "\u5931\u8D25"} \xB7 ${result.class} \xB7 ${result.path}`);
+    for (const check2 of result.checks) {
+      log(`  ${check2.ok ? "OK" : "FAIL"} ${check2.name}${check2.detail ? `\uFF08${check2.detail}\uFF09` : ""}`);
+    }
+    log(`\u7ED3\u8BBA\uFF1A${result.reason}`);
+  }
+  if (!result.ok) process.exitCode = 1;
 }
 function wordPattern(word) {
   let value = String(word || "").toLowerCase().replace(/[^a-z0-9+#.]/g, "");
@@ -25719,16 +26811,17 @@ function evaluatePrompt(prompt, entries, opts = {}) {
     (a, b) => b.score - a.score || (b.entry.priority ?? 50) - (a.entry.priority ?? 50) || String(a.entry.id).localeCompare(String(b.entry.id))
   );
   suppressContainedSiblings(diagnostics);
+  const precision = normalizePrecision(opts.precision) || "balanced";
+  const strictSuggestions = precision === "strict";
   const injectable = diagnostics.filter((item) => item.injectable && item.status !== "suppressed");
-  const bestScore = injectable[0]?.score || 0;
-  const threshold = Math.max(
-    MIN_INJECT_SCORE,
-    Math.min(MAX_INJECT_THRESHOLD, bestScore * RELATIVE_THRESHOLD)
-  );
-  const topK = Math.max(1, Number(opts.topK) || TOP_K);
+  const pool = injectable;
+  const bestScore = pool[0]?.score || 0;
+  const threshold = strictSuggestions ? Math.max(STRICT_MIN_SCORE, Math.min(STRICT_MAX_THRESHOLD, bestScore * STRICT_RELATIVE_THRESHOLD)) : Math.max(MIN_INJECT_SCORE, Math.min(MAX_INJECT_THRESHOLD, bestScore * RELATIVE_THRESHOLD));
+  const configuredTopK = Math.max(1, Number(opts.topK) || TOP_K);
+  const topK = strictSuggestions ? Math.min(configuredTopK, STRICT_TOP_K) : configuredTopK;
   const matches = [];
   const seen = /* @__PURE__ */ new Set();
-  for (const item of injectable) {
+  for (const item of pool) {
     if (item.score < threshold) {
       item.status = "below-threshold";
       continue;
@@ -25743,11 +26836,12 @@ function evaluatePrompt(prompt, entries, opts = {}) {
     matches.push(item);
     if (matches.length >= topK) break;
   }
-  const mandatory = selectMandatory(matches, mustMode);
+  const mandatory = precision === "balanced" ? selectMandatory(matches, mustMode) : selectStrictMandatory(matches, mustMode, text);
   if (mandatory) mandatory.status = "mandatory";
   return {
     text,
     mustMode,
+    precision,
     threshold,
     bestScore,
     matches,
@@ -25769,6 +26863,19 @@ function readMustMode() {
   const user = readJson(CX.files.userOverrides, null);
   return normalizeMustMode(user?.routing?.must) || DEFAULT_MUST_MODE;
 }
+function normalizePrecision(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  return PRECISION_MODES.includes(mode) ? mode : null;
+}
+function readPrecision() {
+  const env = normalizePrecision(process.env.CAP_INDEX_PRECISION);
+  if (env) return env;
+  const user = readJson(CX?.files.userOverrides, null);
+  return normalizePrecision(user?.routing?.precision) || "balanced";
+}
+function hasExplicitConstraint(text) {
+  return EXPLICIT_EXTENSION_RE.test(text) || EXPLICIT_ACTION_RE.test(text) || EXPLICIT_ACTION_EN_RE.test(text);
+}
 function selectMandatory(matches, mustMode = DEFAULT_MUST_MODE) {
   if (mustMode === "never" || matches.length === 0) return null;
   const top = matches[0];
@@ -25781,9 +26888,16 @@ function selectMandatory(matches, mustMode = DEFAULT_MUST_MODE) {
   if (mustMode === "trusted-only" && !top.evidence && top.entry.trust !== "high") return null;
   return top;
 }
+function selectStrictMandatory(matches, mustMode = DEFAULT_MUST_MODE, text = "") {
+  const base = selectMandatory(matches, mustMode);
+  if (!base) return null;
+  if (base.triggerScore + base.cappedKeyword <= 0) return null;
+  if (DISCUSSION_RE.test(text) && !hasExplicitConstraint(text)) return null;
+  return base;
+}
 function buildContextItems(matches, opts = {}) {
   const mustMode = normalizeMustMode(opts.mustMode) || DEFAULT_MUST_MODE;
-  const mandatory = selectMandatory(matches, mustMode);
+  const mandatory = Object.prototype.hasOwnProperty.call(opts, "mandatory") ? opts.mandatory : selectMandatory(matches, mustMode);
   const items = matches.map((item) => ({
     entry: item.entry,
     score: item.score,
@@ -25848,7 +26962,8 @@ function runExplain(opts) {
     return;
   }
   const mustMode = normalizeMustMode(opts.mustMode) || readMustMode();
-  const result = evaluatePrompt(prompt, index.entries, { ...opts, mustMode });
+  const precision = normalizePrecision(opts.precision) || readPrecision();
+  const result = evaluatePrompt(prompt, index.entries, { ...opts, mustMode, precision });
   const examined = result.items.filter((item) => item.status !== "excluded").slice(0, EXPLAIN_LIMIT);
   const payload = {
     version: 1,
@@ -25856,6 +26971,7 @@ function runExplain(opts) {
     builtAt: index.builtAt || null,
     prompt,
     mustMode,
+    precision,
     threshold: scoreRounded(result.threshold),
     bestScore: scoreRounded(result.bestScore),
     evaluated: (index.entries || []).length,
@@ -25877,7 +26993,7 @@ function runExplain(opts) {
     candidate: "[\u5019\u9009]",
     excluded: "[\u6392\u9664]"
   };
-  log(`cap-index explain \xB7 ${CX.client} \xB7 \u7B56\u7565 ${mustMode}`);
+  log(`cap-index explain \xB7 ${CX.client} \xB7 \u7B56\u7565 ${mustMode} \xB7 \u7CBE\u5EA6 ${precision}`);
   log(`prompt: ${prompt}`);
   log(
     `\u9608\u503C ${payload.threshold}\uFF08\u6700\u9AD8 ${payload.bestScore} \xD7 ${RELATIVE_THRESHOLD}\uFF0C\u4E0B\u9650 ${MIN_INJECT_SCORE}\uFF09\xB7 \u6CE8\u5165 ${result.matches.length} \u6761 \xB7 \u6761\u76EE ${payload.evaluated}`
@@ -26011,10 +27127,11 @@ function evalCase(testCase, entries, idMap, entryMap, opts) {
   const expectedMust = resolveEvalList(testCase.must, idMap, testCase.id, "must");
   const forbid = resolveEvalList(testCase.forbid, idMap, testCase.id, "forbid", true);
   const mustMode = normalizeMustMode(opts.mustMode) || DEFAULT_MUST_MODE;
+  const precision = normalizePrecision(opts.precision) || "balanced";
   const topK = Math.max(1, Number(opts.topK) || TOP_K);
   const started = performance.now();
-  const result = evaluatePrompt(prompt, entries, { topK, mustMode });
-  const context = buildContextItems(result.matches, { mustMode });
+  const result = evaluatePrompt(prompt, entries, { topK, mustMode, precision });
+  const context = buildContextItems(result.matches, { mustMode, mandatory: result.mandatory });
   const latencyMs = performance.now() - started;
   const text = context.items.length ? [context.header, ...context.items.map((item) => item.text)].join("\n") : "";
   const tokens = estimateTokens(text);
@@ -26033,8 +27150,8 @@ function evalCase(testCase, entries, idMap, entryMap, opts) {
   const falseMust = Boolean(mandatoryId) && !expectedMust.includes(mandatoryId);
   const forbidHits = forbid.includes("*") ? injected.map((item) => item.id) : injected.filter((item) => forbid.includes(item.id)).map((item) => item.id);
   const signature = (value) => [value.mandatory?.entry.id || "", ...value.items.map((item) => `${item.entry.id}:${item.mandatory}`)].join("|");
-  const second = evaluatePrompt(prompt, entries, { topK, mustMode });
-  const secondContext = buildContextItems(second.matches, { mustMode });
+  const second = evaluatePrompt(prompt, entries, { topK, mustMode, precision });
+  const secondContext = buildContextItems(second.matches, { mustMode, mandatory: second.mandatory });
   const deterministic = signature(context) === signature(secondContext);
   const sanitizationFailure = /ignore\s+(?:all\s+)?previous|always\s+(?:use|call|run)\s+this|<\s*script|https?:\/\/|javascript:/i.test(text);
   return {
@@ -26254,6 +27371,127 @@ function renderEvalMarkdown(report) {
   if (failures.length > 30) lines.push(`> \u5176\u4F59 ${failures.length - 30} \u6761\u89C1 JSON \u62A5\u544A\u3002`, "");
   return lines.join("\n");
 }
+function runEvalFind(opts) {
+  if (!opts.fixture) throw new Error("eval-find \u9700\u8981 --fixture <file>");
+  if (!opts.cases) throw new Error("eval-find \u9700\u8981 --cases <file>");
+  const fixture = loadEvalFile(opts.fixture, "fixture ");
+  const casesFile = loadEvalFile(opts.cases, "\u7528\u4F8B");
+  const entries = buildEvalEntries(fixture.data);
+  const idMap = buildEvalIdMap(entries);
+  const cases = Array.isArray(casesFile.data) ? casesFile.data : casesFile.data.cases;
+  if (!Array.isArray(cases) || cases.length === 0) throw new Error("\u7528\u4F8B\u6587\u4EF6\u9700\u8981\u975E\u7A7A\u6570\u7EC4\u6216 { cases: [...] }");
+  const limit = Math.max(1, Math.min(20, Number(opts.limit) || FIND_LIMIT));
+  const results = [];
+  for (const testCase of cases) {
+    if (testCase.probe === true) continue;
+    const expected = resolveEvalList(testCase.expect || [], idMap, testCase.id, "expect");
+    if (expected.length === 0) continue;
+    const ranked = rankEntries(oneLine(String(testCase.prompt || "")), entries, limit);
+    const ids = ranked.map((item) => item.entry.id);
+    const top1 = Boolean(ids[0]) && expected.includes(ids[0]);
+    const found = expected.filter((id) => ids.includes(id));
+    const firstRank = expected.map((id) => ids.indexOf(id)).filter((index) => index >= 0).sort((a, b) => a - b)[0];
+    results.push({
+      id: testCase.id,
+      category: testCase.category || "uncategorized",
+      prompt: testCase.prompt,
+      expected,
+      ranked: ids,
+      top1,
+      hits: found.length,
+      recall: found.length / expected.length,
+      mrr: firstRank === void 0 ? 0 : 1 / (firstRank + 1),
+      noMatch: ranked.length === 0
+    });
+  }
+  const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  const categories = [...new Set(results.map((result) => result.category))].map((category) => {
+    const group = results.filter((result) => result.category === category);
+    return {
+      category,
+      cases: group.length,
+      top1: average(group.map((result) => result.top1 ? 1 : 0)),
+      recall: average(group.map((result) => result.recall)),
+      mrr: average(group.map((result) => result.mrr)),
+      noMatch: average(group.map((result) => result.noMatch ? 1 : 0))
+    };
+  });
+  const metrics = {
+    cases: results.length,
+    limit,
+    top1: average(results.map((result) => result.top1 ? 1 : 0)),
+    recall: average(results.map((result) => result.recall)),
+    mrr: average(results.map((result) => result.mrr)),
+    noMatch: average(results.map((result) => result.noMatch ? 1 : 0)),
+    fullCoverage: average(results.map((result) => result.hits === result.expected.length ? 1 : 0))
+  };
+  const report = {
+    version: 1,
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    versionName: VERSION,
+    fixture: path.resolve(opts.fixture),
+    casesFile: path.resolve(opts.cases),
+    entries: entries.length,
+    metrics,
+    categories,
+    results
+  };
+  const percent = (value) => `${(value * 100).toFixed(1)}%`;
+  const lines = [
+    "# cap-index find \u68C0\u7D22\u8986\u76D6\u8BCA\u65AD",
+    "",
+    `- \u751F\u6210\u65F6\u95F4\uFF1A${report.generatedAt}`,
+    `- \u7248\u672C\uFF1A${report.versionName}`,
+    `- \u6761\u76EE\uFF1A${entries.length} \xB7 \u6B63\u5411\u7528\u4F8B\uFF1A${metrics.cases} \xB7 top-${limit}`,
+    "",
+    "## \u6C47\u603B",
+    "",
+    "| \u6307\u6807 | \u7ED3\u679C |",
+    "| --- | ---: |",
+    `| Top-1 \u547D\u4E2D\u7387 | ${percent(metrics.top1)} |`,
+    `| Top-${limit} \u53EC\u56DE\u7387 | ${percent(metrics.recall)} |`,
+    `| MRR | ${metrics.mrr.toFixed(3)} |`,
+    `| \u5168\u90E8\u671F\u671B\u547D\u4E2D\u7387 | ${percent(metrics.fullCoverage)} |`,
+    `| \u65E0\u5339\u914D\u7387 | ${percent(metrics.noMatch)} |`,
+    "",
+    "## \u5206\u7C7B\u7ED3\u679C",
+    "",
+    `| \u7C7B\u522B | \u7528\u4F8B | Top-1 | Top-${limit} \u53EC\u56DE | MRR | \u65E0\u5339\u914D |`,
+    "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ...categories.map(
+      (category) => `| ${category.category} | ${category.cases} | ${percent(category.top1)} | ${percent(category.recall)} | ${category.mrr.toFixed(3)} | ${percent(category.noMatch)} |`
+    ),
+    "",
+    "## \u672A\u547D\u4E2D\u793A\u4F8B",
+    "",
+    "| \u7528\u4F8B | prompt | \u671F\u671B | \u5B9E\u9645 top-5 |",
+    "| --- | --- | --- | --- |",
+    ...results.filter((result) => result.recall < 1).slice(0, 20).map(
+      (result) => `| ${result.id} | ${String(result.prompt || "").replace(/\|/g, "\\|").slice(0, 90)} | ${result.expected.join("<br>")} | ${result.ranked.join("<br>") || "\u2014"} |`
+    )
+  ];
+  const markdown = `${lines.join("\n")}
+`;
+  if (opts.out) {
+    const out = path.resolve(opts.out);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, markdown);
+  }
+  if (opts.jsonOut) {
+    const out = path.resolve(opts.jsonOut);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, `${JSON.stringify(report, null, 2)}
+`);
+  }
+  if (opts.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+  log(
+    `eval-find \xB7 ${metrics.cases} \u6761\u6B63\u5411\u7528\u4F8B \xB7 top-${limit} \xB7 Top-1 ${percent(metrics.top1)} \xB7 \u53EC\u56DE ${percent(metrics.recall)} \xB7 MRR ${metrics.mrr.toFixed(3)} \xB7 \u65E0\u5339\u914D ${percent(metrics.noMatch)}`
+  );
+  if (!opts.out && !opts.jsonOut && !opts.quiet) console.log(markdown);
+}
 function runEval(opts) {
   if (!opts.fixture) throw new Error("eval \u9700\u8981 --fixture <file>");
   if (!opts.cases) throw new Error("eval \u9700\u8981 --cases <file>");
@@ -26273,8 +27511,11 @@ function runEval(opts) {
     if ((testCase.must || []).length > 1) throw new Error(`\u7528\u4F8B ${testCase.id} \u6700\u591A\u53EA\u80FD\u58F0\u660E\u4E00\u4E2A must`);
   }
   const mustMode = normalizeMustMode(opts.mustMode) || DEFAULT_MUST_MODE;
+  const precision = normalizePrecision(opts.precision) || "balanced";
   const topK = Math.max(1, Number(opts.topK) || TOP_K);
-  const results = cases.map((testCase) => evalCase(testCase, entries, idMap, entryMap, { topK, mustMode }));
+  const results = cases.map(
+    (testCase) => evalCase(testCase, entries, idMap, entryMap, { topK, mustMode, precision })
+  );
   const summary = summarizeEval(results);
   const gates = evalGates(summary.metrics);
   const report = {
@@ -26286,6 +27527,7 @@ function runEval(opts) {
     entries: entries.length,
     topK,
     mustMode,
+    precision,
     metrics: summary.metrics,
     causeCounts: summary.causeCounts,
     categories: summarizeCategories(summary.core),
@@ -26314,7 +27556,9 @@ function runEval(opts) {
   if (opts.json) {
     console.log(JSON.stringify(report, null, 2));
   } else {
-    log(`eval \xB7 ${summary.metrics.cases} \u6761\u6838\u5FC3\u7528\u4F8B \xB7 \u6761\u76EE ${entries.length} \xB7 top-k ${topK} \xB7 must ${mustMode}`);
+    log(
+      `eval \xB7 ${summary.metrics.cases} \u6761\u6838\u5FC3\u7528\u4F8B \xB7 \u6761\u76EE ${entries.length} \xB7 top-k ${topK} \xB7 must ${mustMode} \xB7 precision ${precision}`
+    );
     for (const gate of gates) {
       log(`${gate.pass ? "\u901A\u8FC7" : "\u5931\u8D25"} ${gate.name}: ${formatGateValue(gate)}\uFF08\u95E8\u69DB ${gate.target}\uFF09`);
     }
@@ -26332,12 +27576,47 @@ async function readStdin(maxBytes = 2 * 1024 * 1024) {
   }
   return Buffer.concat(chunks).toString("utf8");
 }
+function hookOutput(event, text) {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: event,
+      additionalContext: text
+    }
+  });
+}
 async function runHook(sub, opts) {
+  if (process.env.CAP_INDEX_DISABLE === "1") return;
+  if (sub === "session-start") {
+    if (process.env.CAP_INDEX_CATALOG === "0") return;
+    try {
+      let catalog = "";
+      if (fs.existsSync(CX.files.catalog)) {
+        catalog = fs.readFileSync(CX.files.catalog, "utf8").trim();
+      }
+      if (!catalog) {
+        const index = readJson(CX.files.json, null);
+        if (index?.entries) catalog = renderCatalog(index.entries).markdown.trim();
+      }
+      if (!catalog) {
+        spawnBackgroundBuild();
+        catalog = "[cap-index] \u80FD\u529B\u7D22\u5F15\u5C1A\u672A\u5EFA\u7ACB\uFF0C\u6B63\u5728\u540E\u53F0\u751F\u6210\uFF1B\u672C\u6B21\u4F1A\u8BDD\u53EF\u5148\u6B63\u5E38\u5DE5\u4F5C\uFF0C\u4E0B\u4E00\u6B21\u4F1A\u8BDD\u4F1A\u770B\u5230\u80FD\u529B\u76EE\u5F55\u3002";
+      } else if (indexIsStale(STALE_HOURS)) {
+        spawnBackgroundBuild();
+      }
+      process.stdout.write(hookOutput("SessionStart", catalog));
+    } catch (error2) {
+      if (process.env.CAP_INDEX_DEBUG === "1") {
+        console.error(`[cap-index] \u76EE\u5F55\u6CE8\u5165\u5931\u8D25\uFF1A${trimError(error2)}`);
+      }
+    }
+    return;
+  }
   if (sub !== "user-prompt-submit") {
-    console.error("\u7528\u6CD5\uFF1Ahook user-prompt-submit");
+    console.error("\u7528\u6CD5\uFF1Ahook session-start | hook user-prompt-submit");
     process.exitCode = 2;
     return;
   }
+  if (process.env.CAP_INDEX_LEGACY_ROUTE !== "1") return;
   try {
     const raw = await readStdin();
     if (!raw.trim()) return;
@@ -26351,13 +27630,17 @@ async function runHook(sub, opts) {
     }
     if (indexIsStale(24)) spawnBackgroundBuild();
     const mustMode = normalizeMustMode(opts.mustMode) || readMustMode();
-    const matches = matchEntries(prompt, index.entries, { ...opts, mustMode });
-    if (matches.length === 0) return;
+    const precision = normalizePrecision(opts.precision) || readPrecision();
+    const result = evaluatePrompt(prompt, index.entries, { ...opts, mustMode, precision });
+    if (result.matches.length === 0) return;
     process.stdout.write(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
-          additionalContext: hookAdditionalContext(matches, { mustMode })
+          additionalContext: hookAdditionalContext(result.matches, {
+            mustMode,
+            mandatory: result.mandatory
+          })
         }
       })
     );
@@ -26395,19 +27678,19 @@ function stripCapIndexHooks(hooks) {
 function makeHookHandlers() {
   const script = CX.files.runtime;
   return {
+    catalog: {
+      type: "command",
+      command: process.execPath,
+      args: [script, "hook", "session-start", "--client", CX.client, "--home", CX.dataHome],
+      name: "cap-index-catalog",
+      timeout: 8
+    },
     refresh: {
       type: "command",
       command: process.execPath,
       args: [script, "build", "--if-stale", "--quiet", "--sync-runtime", "--client", CX.client, "--home", CX.dataHome],
       name: "cap-index-refresh",
       timeout: 90
-    },
-    route: {
-      type: "command",
-      command: process.execPath,
-      args: [script, "hook", "user-prompt-submit", "--client", CX.client, "--home", CX.dataHome],
-      name: "cap-index-route",
-      timeout: 5
     }
   };
 }
@@ -26425,9 +27708,8 @@ async function install(opts) {
       const next = { ...settings };
       next.hooks = stripCapIndexHooks({ ...settings.hooks || {} });
       next.hooks.SessionStart = Array.isArray(next.hooks.SessionStart) ? next.hooks.SessionStart : [];
+      next.hooks.SessionStart.push({ hooks: [handlers.catalog] });
       next.hooks.SessionStart.push({ async: true, hooks: [handlers.refresh] });
-      next.hooks.UserPromptSubmit = Array.isArray(next.hooks.UserPromptSubmit) ? next.hooks.UserPromptSubmit : [];
-      next.hooks.UserPromptSubmit.push({ hooks: [handlers.route] });
       await writeFileAtomic(CX.settingsFile, `${JSON.stringify(next, null, 2)}
 `);
       hookStatus = "registered";
@@ -27125,6 +28407,256 @@ async function selftest(opts) {
     })
   );
   assert2(output.hookSpecificOutput.additionalContext.includes("deep-research"), "\u94A9\u5B50\u8F93\u51FA\u5305\u542B\u8DEF\u7531");
+  const strictRoutes = [
+    {
+      id: "skill:ppt",
+      kind: "skill",
+      fullName: "ppt",
+      triggers: ["PPT", "PPTX", "\u5E7B\u706F\u7247"],
+      keywords: [],
+      weakKeywords: [],
+      priority: 66,
+      enabled: true,
+      line: "PPT \u2192 skill `ppt`"
+    },
+    {
+      id: "skill:pdf",
+      kind: "skill",
+      fullName: "pdf",
+      triggers: ["PDF"],
+      keywords: [],
+      weakKeywords: [],
+      priority: 60,
+      enabled: true,
+      line: "PDF \u2192 skill `pdf`"
+    }
+  ];
+  const strictDiscussion = evaluatePrompt("\u6211\u4EEC\u8BA8\u8BBA\u4E00\u4E0B PPT \u548C\u5E7B\u706F\u7247\u7684\u8BBE\u8BA1", strictRoutes, {
+    precision: "strict",
+    mustMode: "trusted-only"
+  });
+  assert2(!strictDiscussion.mandatory, "strict \u4E0D\u5BF9\u8BA8\u8BBA\u4E2D\u7684 PPT \u6807\u8BB0\u5FC5\u987B");
+  const strictExplicit = evaluatePrompt("\u5E2E\u6211\u505A\u4E00\u4EFD\u5B63\u5EA6\u590D\u76D8 PPT \u5E7B\u706F\u7247\uFF0C\u5BFC\u51FA\u53EF\u7F16\u8F91\u7684 .pptx", strictRoutes, {
+    precision: "strict",
+    mustMode: "trusted-only"
+  });
+  assert2(strictExplicit.mandatory?.entry.id === "skill:ppt", "strict \u5BF9\u660E\u786E .pptx \u4EFB\u52A1\u6807\u8BB0\u5FC5\u987B");
+  const strictSoft = evaluatePrompt(
+    "please review this deck",
+    [
+      {
+        id: "skill:soft",
+        kind: "skill",
+        fullName: "soft",
+        triggers: [],
+        keywords: [],
+        weakKeywords: [],
+        softTriggers: ["deck"],
+        priority: 50,
+        enabled: true,
+        line: "deck \u2192 skill `soft`"
+      }
+    ],
+    { precision: "strict", mustMode: "trusted-only" }
+  );
+  assert2(!strictSoft.mandatory, "strict \u4E0D\u8BA9\u4EC5\u8F6F\u522B\u540D\u6210\u4E3A\u5FC5\u987B");
+  const strictMany = evaluatePrompt("\u505A PPT \u548C PDF\uFF0C\u518D\u5199 README \u5E76\u751F\u6210\u56FE\u7247", [
+    ...strictRoutes,
+    {
+      id: "skill:docs",
+      kind: "skill",
+      fullName: "docs",
+      triggers: ["README"],
+      keywords: [],
+      weakKeywords: [],
+      priority: 50,
+      enabled: true,
+      line: "README \u2192 skill `docs`"
+    },
+    {
+      id: "skill:img",
+      kind: "skill",
+      fullName: "img",
+      triggers: ["\u751F\u6210\u56FE\u7247"],
+      keywords: [],
+      weakKeywords: [],
+      priority: 55,
+      enabled: true,
+      line: "\u751F\u6210\u56FE\u7247 \u2192 skill `img`"
+    }
+  ], { precision: "strict", topK: 3, mustMode: "trusted-only" });
+  assert2(strictMany.matches.length <= 2, "strict \u6BCF\u6B21\u6700\u591A\u4E24\u6761\u5EFA\u8BAE");
+  const findRoutes = [
+    {
+      id: "skill:ppt",
+      kind: "skill",
+      fullName: "Presentations:pptx",
+      purpose: "\u521B\u5EFA\u3001\u8BFB\u53D6\u3001\u68C0\u67E5\u6216\u7F16\u8F91 PPTX \u6F14\u793A\u6587\u7A3F",
+      description: "Create and edit editable PowerPoint presentations.",
+      triggers: ["PPT", "PPTX", "\u5E7B\u706F\u7247", "\u6F14\u793A\u6587\u7A3F"],
+      keywords: ["pptx", "powerpoint"],
+      weakKeywords: [],
+      priority: 66,
+      enabled: true
+    },
+    {
+      id: "skill:pdf",
+      kind: "skill",
+      fullName: "pdf-tools",
+      purpose: "\u5408\u5E76\u3001\u62C6\u5206\u548C OCR PDF \u6587\u4EF6",
+      description: "Merge, split, and OCR PDF files.",
+      triggers: ["PDF", "\u626B\u63CF\u4EF6", "\u5408\u5E76", "OCR"],
+      keywords: ["pdf", "ocr"],
+      weakKeywords: [],
+      notFor: ["PPT", "\u5E7B\u706F\u7247"],
+      priority: 55,
+      enabled: true
+    },
+    {
+      id: "skill:architecture",
+      kind: "skill",
+      fullName: "architecture-visualization:explore",
+      purpose: "\u67B6\u6784\u56FE\u3001\u4F9D\u8D56\u5206\u6790\u548C\u90E8\u7F72\u62D3\u6251",
+      description: "Architecture modeling, flow, dependency, and deployment analysis.",
+      triggers: ["\u67B6\u6784\u56FE", "\u4F9D\u8D56", "\u90E8\u7F72\u62D3\u6251"],
+      keywords: ["architecture", "diagram"],
+      weakKeywords: [],
+      priority: 72,
+      enabled: true
+    },
+    {
+      id: "skill:docs",
+      kind: "skill",
+      fullName: "docs-writer",
+      purpose: "\u5199 README\u3001\u6280\u672F\u6587\u6863\u548C\u4F7F\u7528\u6307\u5357",
+      description: "Write and edit project README and technical documentation.",
+      triggers: ["README", "\u6280\u672F\u6587\u6863", "\u4F7F\u7528\u6307\u5357"],
+      keywords: ["readme", "docs"],
+      weakKeywords: [],
+      priority: 50,
+      enabled: true
+    },
+    {
+      id: "skill:context7",
+      kind: "skill",
+      fullName: "context7:context7-mcp",
+      purpose: "\u67E5\u8BE2\u6846\u67B6\u3001\u5E93\u548C SDK \u7684\u5B98\u65B9\u6587\u6863",
+      description: "Fetch current library documentation and code examples.",
+      triggers: ["\u5B98\u65B9\u6587\u6863", "API \u6587\u6863", "SDK \u6587\u6863"],
+      keywords: ["docs", "api", "library"],
+      weakKeywords: [],
+      priority: 80,
+      enabled: true
+    },
+    {
+      id: "skill:imagegen",
+      kind: "skill",
+      fullName: "imagegen",
+      purpose: "\u751F\u6210\u63D2\u753B\u3001\u6D77\u62A5\u548C\u5C01\u9762\u56FE",
+      description: "Generate raster images from prompts.",
+      triggers: ["\u751F\u6210\u56FE\u7247", "\u6D77\u62A5", "\u63D2\u753B", "\u5C01\u9762\u56FE"],
+      keywords: ["image", "poster", "illustration"],
+      weakKeywords: [],
+      priority: 55,
+      enabled: true
+    }
+  ];
+  assert2(rankEntries("\u628A\u5B63\u5EA6\u590D\u76D8\u505A\u6210\u53EF\u7F16\u8F91\u7684PPT", findRoutes, 5)[0]?.entry.id === "skill:ppt", "find \u547D\u4E2D PPTX");
+  assert2(rankEntries("\u5408\u5E76\u626B\u63CF\u4EF6\u91CC\u7684\u53D1\u7968\u6587\u5B57", findRoutes, 5)[0]?.entry.id === "skill:pdf", "find \u547D\u4E2D PDF/OCR");
+  assert2(rankEntries("\u753B\u7CFB\u7EDF\u4F9D\u8D56\u56FE", findRoutes, 5)[0]?.entry.id === "skill:architecture", "find \u547D\u4E2D\u67B6\u6784\u56FE");
+  assert2(rankEntries("\u5199\u4E00\u4EFD README", findRoutes, 5)[0]?.entry.id === "skill:docs", "find \u547D\u4E2D README");
+  assert2(rankEntries("\u67E5 React \u5B98\u65B9\u6587\u6863", findRoutes, 5)[0]?.entry.id === "skill:context7", "find \u547D\u4E2D\u5B98\u65B9\u6587\u6863");
+  assert2(rankEntries("\u751F\u6210\u4E00\u5F20\u6D77\u62A5", findRoutes, 5)[0]?.entry.id === "skill:imagegen", "find \u547D\u4E2D\u6D77\u62A5");
+  assert2(rankEntries("\u5468\u672B\u53BB\u54EA\u73A9", findRoutes, 5).length === 0, "find \u65E0\u5173\u67E5\u8BE2\u65E0\u5019\u9009");
+  const catalog = renderCatalog(findRoutes);
+  assert2(catalog.markdown.includes("\u6587\u6863\u4E0E\u6F14\u793A") && catalog.markdown.includes("Presentations:pptx"), "\u76EE\u5F55\u5206\u7EC4\u5305\u542B\u5173\u952E\u80FD\u529B");
+  assert2(catalog.tokens <= CATALOG_TOKEN_BUDGET, "\u76EE\u5F55\u4E0D\u8D85\u8FC7 token \u9884\u7B97");
+  assert2(
+    capabilityClass({ id: "skill:imagegen", fullName: "imagegen", purpose: "\u751F\u6210\u56FE\u7247" }) === "raster-image",
+    "\u80FD\u529B\u7C7B\u522B\uFF1A\u56FE\u7247"
+  );
+  assert2(
+    capabilityClass({ id: "family:Presentations", fullName: "Presentations:pptx", purpose: "PPTX" }) === "presentation",
+    "\u80FD\u529B\u7C7B\u522B\uFF1APPTX"
+  );
+  assert2(
+    capabilityClass({ id: "mcp:context7", fullName: "context7", purpose: "official docs" }) === "docs-lookup",
+    "\u80FD\u529B\u7C7B\u522B\uFF1A\u6587\u6863"
+  );
+  assert2(classifyTask("\u505A\u4E00\u5F20\u5C01\u9762\u56FE").class === "raster-image", "\u4EFB\u52A1\u7C7B\u522B\uFF1A\u56FE\u7247");
+  assert2(classifyTask("\u505A\u4E00\u4EFD\u53EF\u7F16\u8F91\u7684 PPTX").class === "presentation", "\u4EFB\u52A1\u7C7B\u522B\uFF1APPTX");
+  assert2(classifyTask("\u7528\u6D4F\u89C8\u5668\u68C0\u67E5\u672C\u5730\u9875\u9762\u5E76\u622A\u56FE").class === "browser", "\u4EFB\u52A1\u7C7B\u522B\uFF1A\u6D4F\u89C8\u5668");
+  assert2(classifyTask("\u5199\u4E00\u6BB5\u603B\u7ED3").class === "general", "\u4EFB\u52A1\u7C7B\u522B\uFF1Ageneral");
+  assert2(
+    capabilityClass({ id: "group:run-verify", fullName: "group:run-verify", purpose: "\u8FD0\u884C\u9879\u76EE\u3001\u9A8C\u8BC1\u6539\u52A8" }) === "testing",
+    "\u80FD\u529B\u7C7B\u522B\uFF1A\u8FD0\u884C\u9A8C\u8BC1"
+  );
+  const roleOverrides = mergeOverrides(
+    { version: 1 },
+    { version: 1, roles: { presentation: ["skill:custom"] } }
+  );
+  assert2(roleOverrides.roles.presentation?.[0] === "skill:custom", "override roles \u751F\u6548");
+  assert2(compareVersions("0.6.1", "0.6.0") > 0, "\u7248\u672C\u6BD4\u8F83\uFF1A\u5347\u7EA7");
+  assert2(isDowngrade("0.6.0", "0.6.1"), "\u7248\u672C\u6BD4\u8F83\uFF1A\u8BC6\u522B\u964D\u7EA7");
+  assert2(!isDowngrade("0.6.1", "0.6.1"), "\u7248\u672C\u6BD4\u8F83\uFF1A\u540C\u7248\u4E0D\u964D\u7EA7");
+  assert2(sourceVersionOf('var VERSION = "1.2.3";') === "1.2.3", "\u7248\u672C\u63D0\u53D6\uFF1Abundle var");
+  const policySample = {
+    version: 1,
+    classes: {
+      "raster-image": { prefer: "tool", fallback: "native", qualityGate: ["PNG"], reason: "image faster" },
+      presentation: { prefer: "native-first", fallback: "tool", qualityGate: ["pptx"], reason: "native first" },
+      general: { prefer: "native", fallback: null, qualityGate: [], reason: "native" }
+    }
+  };
+  const rolesSample = {
+    version: 1,
+    classes: {
+      "raster-image": [{ id: "skill:img", fullName: "img", kind: "skill", available: true, priority: 60 }],
+      presentation: [{ id: "skill:ppt", fullName: "ppt", kind: "skill", available: true, priority: 50 }]
+    }
+  };
+  const imageDecision = decideTask("\u505A\u4E00\u5F20\u5C01\u9762\u56FE", policySample, rolesSample);
+  assert2(
+    imageDecision.recommendation === "tool" && imageDecision.preferredCapability?.id === "skill:img",
+    "decide \u56FE\u7247\u4F18\u5148\u5DE5\u5177"
+  );
+  const pptDecision = decideTask("\u505A\u4E00\u4EFD\u53EF\u7F16\u8F91\u7684 PPTX", policySample, rolesSample);
+  assert2(
+    pptDecision.recommendation === "native" && pptDecision.fallback === "tool",
+    "decide PPTX \u5148 native \u518D\u56DE\u9000"
+  );
+  assert2(decideTask("\u5199\u4E00\u6BB5\u603B\u7ED3", policySample, rolesSample).recommendation === "native", "decide general native");
+  const checkEntries = [
+    {
+      id: "skill:imagegen",
+      kind: "skill",
+      fullName: "imagegen",
+      purpose: "\u751F\u6210\u63D2\u753B\u3001\u6D77\u62A5\u548C\u5C01\u9762\u56FE",
+      triggers: ["\u793E\u4EA4\u5361\u7247"],
+      keywords: [],
+      enabled: true,
+      priority: 55
+    }
+  ];
+  const unclearDecision = decideTask("\u8981\u505A\u4E2A\u793E\u4EA4\u5361\u7247", policySample, rolesSample, checkEntries);
+  assert2(
+    unclearDecision.recommendation === "unclear" && unclearDecision.check[0]?.id === "skill:imagegen" && unclearDecision.confidence === "low",
+    "decide \u672A\u8BC6\u522B\u65F6\u7ED9\u5019\u9009"
+  );
+  const verifyDir = fs.mkdtempSync(path.join(os.tmpdir(), "cap-index-verify-"));
+  const pngFile = path.join(verifyDir, "cover.png");
+  fs.writeFileSync(pngFile, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]));
+  assert2(verifyArtifact(pngFile, "raster-image").ok, "verify PNG \u901A\u8FC7");
+  const fakePptx = path.join(verifyDir, "fake.pptx");
+  fs.writeFileSync(fakePptx, "<html>not a pptx</html>");
+  assert2(!verifyArtifact(fakePptx, "presentation").ok, "verify \u4F2A PPTX \u5931\u8D25");
+  const realishPptx = path.join(verifyDir, "deck.pptx");
+  fs.writeFileSync(realishPptx, "PK[Content_Types].xml ppt/presentation.xml");
+  assert2(verifyArtifact(realishPptx, "presentation").ok, "verify OOXML \u7ED3\u6784\u901A\u8FC7");
+  const htmlFile = path.join(verifyDir, "index.html");
+  fs.writeFileSync(htmlFile, "<!doctype html><html></html>");
+  assert2(verifyArtifact(htmlFile, "website").ok, "verify HTML \u901A\u8FC7");
+  fs.rmSync(verifyDir, { recursive: true, force: true });
   try {
     await connectAndListTools(
       {
@@ -27205,8 +28737,17 @@ function parseArgs(argv) {
     } else if (arg === "--must") {
       opts.mustMode = next ?? null;
       index += 1;
+    } else if (arg === "--precision") {
+      opts.precision = next ?? null;
+      index += 1;
     } else if (arg === "--top-k") {
       opts.topK = Number(next) || TOP_K;
+      index += 1;
+    } else if (arg === "--limit") {
+      opts.limit = Number(next) || FIND_LIMIT;
+      index += 1;
+    } else if (arg === "--class") {
+      opts.artifactClass = next ?? null;
       index += 1;
     } else if (arg === "--stale-hours") {
       opts.staleHours = Number(next) || STALE_HOURS;
@@ -27240,7 +28781,7 @@ function parseArgs(argv) {
   return opts;
 }
 function printHelp() {
-  console.log(`cap-index ${VERSION} \u2014 \u5DF2\u5B89\u88C5 Skills / MCP \u7684\u610F\u56FE\u8DEF\u7531
+  console.log(`cap-index ${VERSION} \u2014 \u80FD\u529B\u76EE\u5F55\u3001\u68C0\u7D22\u4E0E native/\u5DE5\u5177\u51B3\u7B56
 
 Usage: cap-index <command> [options]
 
@@ -27250,9 +28791,14 @@ Commands:
   build              \u626B\u63CF skills/MCP \u5E76\u751F\u6210\u7D22\u5F15
   check              \u68C0\u67E5\u7D22\u5F15\u662F\u5426\u8FC7\u671F
   list               \u67E5\u770B\u6761\u76EE\uFF08--json \u8F93\u51FA\u673A\u5668\u53EF\u8BFB\u7ED3\u679C\uFF09
+  catalog            \u8F93\u51FA\u4F1A\u8BDD\u7EA7\u80FD\u529B\u76EE\u5F55
+  find               \u6309\u9700\u6C42\u68C0\u7D22\u80FD\u529B\uFF08\u53EA\u8BFB\uFF0C\u4E0D\u6CE8\u5165\uFF09
+  decide             \u4EFB\u52A1\u524D\u5EFA\u8BAE native/\u5DE5\u5177\uFF1B\u672A\u8BC6\u522B\u65F6\u8FD4\u56DE\u5019\u9009\uFF0C\u4E0D\u4E0B native \u7ED3\u8BBA
+  verify             \u6821\u9A8C\u4EA7\u7269\u683C\u5F0F\uFF08pptx/pdf/\u56FE\u7247/svg/html/site\uFF09
   explain            \u89E3\u91CA\u4E00\u6B21 prompt \u7684\u8DEF\u7531\u8BC4\u5206\u4E0E\u6CE8\u5165\u51B3\u7B56
   eval               \u5728\u56FA\u5B9A fixture \u4E0A\u8FD0\u884C\u8DEF\u7531\u8BC4\u6D4B
-  hook               \u4F9B\u5BA2\u6237\u7AEF\u94A9\u5B50\u8C03\u7528\uFF08user-prompt-submit\uFF09
+  eval-find          \u8BCA\u65AD find \u7684\u68C0\u7D22\u8986\u76D6\u7387\uFF08\u4E0D\u8BC4\u4F30 must/P@1\uFF09
+  hook               \u4F9B\u5BA2\u6237\u7AEF\u94A9\u5B50\u8C03\u7528\uFF08session-start / user-prompt-submit\uFF09
   selftest           \u8FD0\u884C\u5185\u7F6E\u81EA\u68C0
 
 Options:
@@ -27271,7 +28817,10 @@ Options:
   --remove-static    \u5378\u8F7D\u65F6\u79FB\u9664\u6258\u7BA1\u533A\u5757
   --purge            \u5378\u8F7D\u65F6\u5220\u9664\u5BA2\u6237\u7AEF\u6570\u636E\u76EE\u5F55
   --top-k <n>        \u6BCF\u6B21 prompt \u6700\u591A\u6CE8\u5165\u7684\u8DEF\u7531\u6570\uFF08\u9ED8\u8BA4 ${TOP_K}\uFF09
+  --limit <n>        find \u8FD4\u56DE\u7684\u5019\u9009\u6570\uFF08\u9ED8\u8BA4 ${FIND_LIMIT}\uFF09
+  --class <name>     verify \u7684\u4EA7\u7269\u7C7B\u522B\uFF08presentation / raster-image / pdf / svg / website / diagram / site\uFF09
   --must <mode>      [\u5FC5\u987B] \u7B56\u7565\uFF1Atrusted-only | always | never\uFF08\u9ED8\u8BA4 ${DEFAULT_MUST_MODE}\uFF09
+  --precision <mode> \u8DEF\u7531\u7CBE\u5EA6\uFF1Abalanced | strict\uFF08\u9ED8\u8BA4 balanced\uFF09
   --json             list / explain \u8F93\u51FA\u673A\u5668\u53EF\u8BFB JSON
   --timeout <ms>     \u5355\u6B21 MCP \u64CD\u4F5C\u8D85\u65F6\uFF08\u9ED8\u8BA4 ${MCP_TIMEOUT}\uFF09
   --max-tokens <n>   \u9759\u6001\u8DEF\u7531\u8868\u4F53\u79EF\u9884\u7B97\uFF08\u9ED8\u8BA4 ${MAX_TOKENS}\uFF09
@@ -27298,8 +28847,13 @@ async function main() {
   if (command === "build") return build(opts);
   if (command === "check") return check(opts);
   if (command === "list") return list(opts);
+  if (command === "catalog") return runCatalog(opts);
+  if (command === "find") return runFind(opts);
+  if (command === "decide") return runDecide(opts);
+  if (command === "verify") return runVerify(opts);
   if (command === "explain") return runExplain(opts);
   if (command === "eval") return runEval(opts);
+  if (command === "eval-find") return runEvalFind(opts);
   if (command === "hook") return runHook(sub, opts);
   if (command === "install") return install(opts);
   if (command === "uninstall") return uninstall(opts);

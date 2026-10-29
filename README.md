@@ -1,6 +1,6 @@
 # Cap Index（Qoder 插件）
 
-按 prompt 动态注入能力路由：把当前请求与本机已安装的 Skills、MCP 工具做匹配，只注入真正相关的 2–5 条，避免每次会话都加载完整工具清单。
+在会话开始注入一份紧凑的能力目录；需要细节时用 `find` 检索，任务开始前用 `decide` 获取建议或候选，产物生成后用 `verify` 检查格式。默认不再对每个 prompt 打分或强制某个能力。
 
 ## 安装
 
@@ -8,77 +8,70 @@
 
 ```bash
 qodercli plugins install <本目录>
-# 或从 Release zip 安装
-qodercli plugins install https://github.com/Screamity/cap-index/releases/download/v0.4.0/cap-index-0.4.0.zip
 ```
 
 本地 zip 文件不受支持：请先解压，再安装解压出的插件目录。
 
-本地验证：
-
-```bash
-qodercli plugins validate <本目录>
-qodercli --plugin-dir <本目录> -p "帮我做个PPT"
-```
-
-安装后重启会话。首次会话会在后台建立索引；之后的新 prompt 会开始注入路由。
+安装后重启会话。首次会话会在后台建立索引；`SessionStart` 同步读取已生成的目录，索引缺失时只输出一行 bootstrap，不阻塞会话。
 
 ## 组成
 
 - `hooks/hooks.json`
-  - `SessionStart`（async）：索引过期时后台重建，并把运行时同步到 `~/.cap-index/runtime/`
-  - `UserPromptSubmit`：读取索引，匹配当前 prompt，通过 `hookSpecificOutput.additionalContext` 注入 top-k 路由
-- `skills/cap-index/SKILL.md`：排查与重建索引的说明
-- `commands/cap-index.md`：`/cap-index [list|build|check]`
-- `cap-index.bundle.mjs` + `defaults/overrides.json`：单文件运行时与出厂覆盖（默认为空，路由从本机已安装能力自动生成）
+  - `SessionStart`（同步）：`hook session-start` 读取 `~/.cap-index/qoder/capability-catalog.md`，通过 `hookSpecificOutput.additionalContext` 注入能力目录
+  - `SessionStart`（async）：`build --if-stale --quiet --sync-runtime` 保持索引和运行时新鲜
+  - 默认不再注册 `UserPromptSubmit` 逐 prompt 路由
+- `skills/cap-index/SKILL.md`：目录、检索与重建说明
+- `commands/cap-index.md`：`/cap-index [list|find <need>|decide <task>|verify <path>|catalog|build|check]`
+- `cap-index.bundle.mjs` + `defaults/overrides.json`：单文件运行时与出厂覆盖
 
-## 匹配与诊断
+## 能力目录与检索
 
-- 触发词从明确的意图标记提取（`Use when…`、`适用于…`、`当…时`），通用词和长句碎片会被过滤。
-- 英文按词级匹配并允许少量间隔词；内置中英别名组提供软触发词，用于同义词召回，但不参与 `[必须]` 计分。
-- 关键词分强 / 弱两层；只有弱关键词命中时不注入，除非条目设置 `trust: "high"` 或策略为 `always`。
-- `notFor`（`Do not use for…` / `不适用于…`）是硬排除；阈值只统计可注入候选。
-- 第三方描述会先清洗：移除控制/零宽字符、HTML/script、代码块与 URL；路由行跳过祈使句和注入话术，没有安全摘要时只保留名称。
-- 单条路由行最多 150 字，单次注入最多 600 字 / 约 240 tokens；超限优先丢弃最长的建议，不丢必须。
-- 用 `explain` 查看一条 prompt 的完整判定链：
-
-```bash
-node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT"
-node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" explain --client qoder "帮我做个 PPT" --json
-```
+- 目录按文档、调研、工程、架构、网站、个人事务、桌面、扩展、安全分组；每条只放名称和一句用途。
+- 状态异常的 MCP 会标注 `[不可用]` / `[缓存]`；advisory 条目标注 `[建议]`。
+- `find` 是检索工具，不是意图判定：返回 top5 候选、用途、适用/不适用与调用目标；是否使用由 agent 结合任务判断。
+- `decide` 读取可移植 `defaults/policy.json` + 本机 `capability-roles.json`：强信号给出 native-first / tool / blocked、质量门槛与回退；未识别时返回 `unclear` + 候选，不冒充 native 结论。
+- `verify` 检查 `.pptx`、PDF、图片、SVG、HTML 或站点目录的格式；失败时按 decide 的回退切到能力。
+- 中文按 bigram/trigram，英文按词级；字段加权 BM25，`notFor` 命中时降权并提示，不硬排除。
+- 默认保持沉默；旧的逐 prompt 分数路由仅在 `CAP_INDEX_LEGACY_ROUTE=1` 时启用。
 
 ## 数据
 
-- `~/.cap-index/qoder/`：索引、MCP 缓存、可选用户覆盖
+- `~/.cap-index/qoder/capability-catalog.md`：会话目录
+- `~/.cap-index/qoder/capabilities.json`：能力条目（schema 3）
+- `~/.cap-index/qoder/capability-roles.json`：本机能力到类别的映射（本地生成，不上传）
+- `~/.cap-index/qoder/mcp-cache.json`：MCP 工具缓存
 - `~/.cap-index/runtime/`：插件与 npm CLI 共用的运行时
 - 第三方描述清洗后入库；不保存 MCP 的 env / headers / 凭据
 
-## 定制
-
-在 `~/.cap-index/qoder/overrides.json` 中覆盖触发词与优先级，然后运行：
+## 诊断
 
 ```bash
-node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" build --client qoder --refresh
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" catalog --client qoder
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" find "合并扫描PDF" --client qoder
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" list --client qoder
+node "$HOME/.cap-index/runtime/cap-index.bundle.mjs" eval-find --fixture test/fixtures/capabilities.json --cases <cases.json>
 ```
 
-`[必须]` 默认只在最高分条目同时满足分数、领先幅度与证据门槛时出现，最多一条。可在用户覆盖中调整：
+## 回滚
 
-```json
-{
-  "version": 1,
-  "routing": { "must": "trusted-only" }
-}
-```
+- `CAP_INDEX_DISABLE=1`：所有 hook no-op
+- `CAP_INDEX_CATALOG=0`：关闭目录注入
+- `CAP_INDEX_LEGACY_ROUTE=1`：恢复旧的逐 prompt 分数路由
+- 旧版插件目录保留，可切回 0.4.0
 
-`must` 可取 `trusted-only`（默认）、`always`、`never`；环境变量 `CAP_INDEX_MUST` 优先。
+## v0.6.1 变更
 
-## v0.4.0 变更
+- `decide` 改为分句判定（否定作用域 + 动作动词），未识别时返回 `unclear` + 候选，不下 native 结论。
+- 强信号仍给 tool / native-first / blocked；质量门槛和回退不变。
+- 自动/ hook 同步不再降级 runtime；显式 `build --sync-runtime` 仍可回滚。
 
-- 新增内置中英同义词 / 别名层，作为软触发词参与召回，不参与 `[必须]` 计分。
-- 英文触发词支持词级弹性匹配，允许少量间隔词；MCP 工具增加“动作 + 对象”关键词。
-- 新增具体度抑制与 2.4 阈值上限，降低同义命中带来的重复路由。
-- 增加代码评审文档类负向守卫，并补充固定集 / 盲测 / 85 项 selftest。
-- 已知边界：`slides` 与 `Presentations` 等同一输出形态的替代能力仍可能同时注入；`[必须]` 的盲测标注口径仍在评估中。
+## v0.6.0 变更
+
+- 新增 `decide`：任务开始前给出 native-first / tool / blocked、质量门槛与回退。
+- 新增本机 `capability-roles.json`：能力类别映射；可在 `overrides.json` 的 `roles` 覆盖。
+- 新增 `verify`：检查 PPTX/PDF/图片/SVG/HTML/站点格式。
+- 策略默认“质量优先、时间其次”，token 暂不作为硬限制。
+- 保留 `find`/`catalog`/`eval-find`；旧路由仅作诊断。
 
 ## 卸载
 

@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "classes": {
+    "raster-image": {
+      "prefer": "tool",
+      "fallback": "native",
+      "qualityGate": ["real raster PNG/JPG", "no text unless requested"],
+      "reason": "Image tools are usually much faster; verify the output is a real raster image."
+    },
+    "presentation": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["valid editable .pptx", "requested page count and sections"],
+      "reason": "Native and presentation tooling can both meet the contract; try native first, fall back to the capability."
+    },
+    "architecture-diagram": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["diagram file, not text only", "required nodes and edges"],
+      "reason": "Native diagram output is competitive; keep the diagram capability as fallback."
+    },
+    "sites": {
+      "prefer": "tool",
+      "fallback": "native",
+      "requires": "descriptor",
+      "qualityGate": ["Qoder Sites descriptor/config", "local preview", "no external publish"],
+      "reason": "Use Sites when a Qoder Sites descriptor/config is available; otherwise fall back to a local static site."
+    },
+    "docs-lookup": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["official or versioned source", "no invented API"],
+      "reason": "Native web lookup is competitive; use the docs capability when it is available and more authoritative."
+    },
+    "gui": {
+      "prefer": "tool",
+      "fallback": "blocked",
+      "requires": "available",
+      "qualityGate": ["observed GUI state", "no destructive action"],
+      "reason": "Desktop/GUI tasks need a desktop-automation capability."
+    },
+    "testing": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["tests or runtime evidence", "no unrelated changes"],
+      "reason": "Run/verify can be done natively; use the capability as a fallback."
+    },
+    "browser": {
+      "prefer": "tool",
+      "fallback": "blocked",
+      "requires": "available",
+      "qualityGate": ["DOM/page evidence", "no destructive action"],
+      "reason": "Browser tasks need browser automation."
+    },
+    "internal-knowledge": {
+      "prefer": "tool",
+      "fallback": "blocked",
+      "requires": "configured",
+      "qualityGate": ["answer cites an internal source", "no fabrication"],
+      "reason": "Internal knowledge requires a configured knowledge source."
+    },
+    "security-scan": {
+      "prefer": "tool",
+      "fallback": "native",
+      "requires": "available",
+      "qualityGate": ["scan report", "no real secrets exposed"],
+      "reason": "Security scanning benefits from the dedicated scanner; native review is the fallback."
+    },
+    "code-review": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["findings with evidence", "no rewrite unless asked"],
+      "reason": "Code review can be done natively; use the advisory capability as a fallback."
+    },
+    "research": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["multiple independent sources", "citations"],
+      "reason": "Native research is competitive; use the research capability when it adds sourcing."
+    },
+    "redis": {
+      "prefer": "native-first",
+      "fallback": "tool",
+      "qualityGate": ["diagnosis or plan", "no destructive commands"],
+      "reason": "Redis advice can be given natively; use the capability for deeper RQE/cache analysis."
+    },
+    "general": {
+      "prefer": "native",
+      "fallback": null,
+      "qualityGate": ["meets task acceptance"],
+      "reason": "No specialized capability is required."
+    }
+  }
+}
